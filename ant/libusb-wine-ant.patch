@@ -1,0 +1,4554 @@
+diff --git a/HACKING.md b/HACKING.md
+new file mode 100644
+index 0000000..1f3d12a
+--- /dev/null
++++ b/HACKING.md
+@@ -0,0 +1,209 @@
++# Working on libusb-wine
++
++Notes for whoever changes this code next: how the pieces fit, what
++libusb-win32 behaviour is reproduced and why, and which kernel behaviour
++the code relies on.
++
++## The pieces
++
++| File | What it is |
++|---|---|
++| `src/usb.c`, `src/descriptors.c`, `src/error.c` | libusb 0.1's portable part: the device list, descriptor parsing, the error string |
++| `src/linux.c` | everything that touches usbfs: listing devices, configurations and interfaces, transfers, the asynchronous API |
++| `src/usb-wine.c` | the Wine side: `DllMain()`, `usb_get_version()`, `SetLastError()` |
++| `src/usb.h` | the API, with libusb-win32's structure layout (`#pragma pack(1)`) |
++| `src/libusb0.spec` | what the DLL exports |
++| `tests/` | an emulated usbfs and a Windows test program; see Testing |
++
++## How Wine runs it
++
++`libusb0.dll.so` is a winelib DLL: an ELF shared object that Wine loads
++into the Windows process and that Windows code calls directly, with no
++thunk in between. Much follows from that.
++
++**The calling convention.** Windows code calls with the Microsoft x64
++convention; gcc on Linux compiles for System V. Every exported function
++carries `LIBUSB_API` (`__attribute__((ms_abi))`), and gcc refuses a
++definition whose attribute differs from its prototype in `usb.h`. A new
++export needs a prototype there, with `LIBUSB_API`, and a line in
++`libusb0.spec`; `-Werror=missing-prototypes` catches a forgotten prototype.
++
++**Two worlds in one library.** `linux.c` is ordinary Linux code: it uses
++pthreads, `poll()`, `eventfd` and Linux headers. Wine's Windows headers
++stay out of it, because they clash with the system ones. The one Windows
++call the library needs, `SetLastError()`, goes through
++`usbwine_set_last_error()` in `usb-wine.c`, which is compiled with Wine's
++headers.
++
++**Loading.** A program finds the DLL by its name: Wine looks for a file
++called `libusb0.dll` in the program's folder, in `system32`, and so on.
++If that file is Wine's placeholder (`libusb0.dll.fake`), or if the
++`libusb0` DLL override says `builtin`, Wine loads the builtin, which it
++looks for in its own folders first and then in `WINEDLLPATH`. Without
++any `libusb0.dll` file the load fails, builtin or not. `README.md` gives
++the commands.
++
++## libusb-win32 behaviour, and how it is reproduced
++
++Windows programs are written and tested against libusb-win32, so its
++behaviour is the specification, quirks included. Its source
++(`libusb/src/windows.c` and `error.c` in libusb-win32 1.2.x) is the
++reference wherever this file says "as libusb-win32 does".
++
++| | libusb-win32 | here |
++|---|---|---|
++| devices listed | those bound to its driver | those this user may open for writing; no hubs |
++| `bus->root_dev` | a virtual hub with every device as a child | the same |
++| `usb_open()` of a device that cannot be opened | `NULL` | `NULL` |
++| configuration after `usb_open()` | the device's current one, cached by the driver | the current one, from sysfs |
++| `usb_set_configuration()` to the current one | nothing | nothing (Linux would reset the endpoints) |
++| `usb_set_configuration()` with an interface claimed | `-EINVAL` | `-EINVAL` |
++| `usb_claim_interface()` without a configuration | `-EINVAL` | `-EINVAL` |
++| `usb_claim_interface()` of the claimed interface | `0` | `0` |
++| `usb_close()` | releases the claimed interface | the same |
++| errors returned | `-EINVAL`, `-ETRANSFER_TIMEDOUT` (116), `-ENOMEM`, `-EIO` | Linux errors folded into the same four (`win_error()`) |
++| bulk vs. interrupt transfers | the same driver request | the same: `USBDEVFS_BULK`, or bulk URBs |
++| synchronous timeout 0 | no timeout | no timeout |
++| `usb_reap_async()` timeout | `WaitForSingleObject()`'s: 0 polls, negative waits for ever | the same |
++| after a reap times out | `usb_reap_async()` cancels, `_nocancel()` does not | the same |
++| reaping a finished request again | the same result | the same result |
++| `usb_cancel_async()` | aborts every request on the endpoint, synchronously | the same |
++| `usb_submit_async()` | needs a configuration and a claimed interface | the same |
++| last error after a failed reap | `ERROR_OPERATION_ABORTED` (cancelled, unplugged), `ERROR_GEN_FAILURE` (failed) | the same |
++| last error after a timed-out reap | whatever was there before | `ERROR_SEM_TIMEOUT` |
++
++The last line is a deliberate difference. `ANT_DLL` reads a timeout with
++`ERROR_OPERATION_ABORTED` as "the stick lost power" and starts over, and
++a value left over from an earlier cancel would make an ordinary timeout
++look like that.
++
++Two more differences, both on the side of safety: `usb_free_async()`
++stops a request that is still running (libusb-win32 frees the context
++and lets the driver write into it later), and a reap that times out with
++cancel returns the data if the request finished just before the cancel.
++
++## Taking devices from kernel drivers
++
++On Windows a device used through libusb-win32 is bound to the libusb0
++driver and nothing else. On Linux the kernel may have bound a driver of
++its own, and a program can only claim the interface if that driver lets
++go. The library never makes it let go, except for the devices in
++`take_from_kernel[]` in `linux.c`. For those, `usb_claim_interface()`
++uses `USBDEVFS_DISCONNECT_CLAIM` with `EXCEPT_DRIVER "usbfs"`, which takes
++the interface from a kernel driver in one step but never from another
++program using usbfs.
++
++The list is kept short on purpose. Programs probe: `ANT_DLL` opens every
++listed device, sets configuration 1 and claims interface 0, just to see
++whether it can. With the old behaviour, which detached interface 0's
++driver inside `usb_set_configuration()`, every device the user could
++write to lost its driver that way: a phone, a camera, a game controller.
++A device belongs on the list when
++Linux binds it to a driver that a Windows user of libusb-win32 would
++never have, as `usb_serial_simple` does with the ANT sticks. Add it with
++its vendor and product ID and the driver's name in a comment.
++`LIBUSB0_DETACH_KERNEL_DRIVER=1` is the escape hatch for anything else.
++
++## The asynchronous API
++
++### Why it needs an engine
++
++usbfs has one completion queue per open file, not one per request.
++`REAPURB` hands out the next finished URB, whoever submitted it. A
++program like `ANT_DLL` keeps a read pending on one thread, reaps it with
++a one-second timeout, and writes from another thread, so two threads
++reaping independently would take each other's completions.
++
++### How it works
++
++Everything lives in `struct linux_handle`, one per open device, under
++its mutex:
++
++- Each context (`struct usb_async`) is `IDLE` (never submitted, or the
++  last submit failed), `PENDING`, or `DONE` with a result and a last
++  error.
++- **Only `drain_locked()` reaps.** It calls `REAPURBNDELAY` until the
++  queue is empty and files every URB with the context it belongs to,
++  found by the URB's address.
++- **Waiting** (`wait_for()`): one waiting thread at a time sleeps in
++  `poll()` on the device with the lock released. usbfs reports `POLLOUT`
++  while a finished URB is queued. When it wakes it drains, which files
++  everyone's results and broadcasts the condition variable. The other
++  waiting threads sleep on that condition variable and take over `poll()`
++  when the poller leaves; they also drain now and then on their own, in
++  case the poller is held up.
++- A thread that files a result while another thread is in `poll()`
++  writes to an `eventfd` that is part of that `poll()`, so the poller
++  never sleeps through a result that someone else collected for it.
++- **Unplugging**: `REAPURBNDELAY` returns `ENODEV` once the device is gone
++  and nothing is left to reap, and `poll()` returns at once with `POLLHUP`.
++  `h->gone` records it, and waiting threads then nap 10 ms at a time
++  until the kernel has given everything back, which takes milliseconds.
++- **Closing** (`async_close()`): discards everything pending, drains, and
++  sets `h->closing`; from then on nobody reaps. Requests still pending
++  are marked aborted, threads in `wait_for()` are woken and leave, and
++  `async_close()` waits up to two seconds for them before freeing the
++  state. If a thread does not leave (it was suspended, say), the state
++  and the device's file are left open for it rather than freed under it.
++
++### Rules to keep
++
++1. Nothing but `drain_locked()` calls a reap ioctl.
++2. Nobody sleeps holding the lock: `poll()` runs with it released, and
++   condition-variable waits release it.
++3. The kernel writes to a context's URB (status, length, data) only when
++   that URB is reaped. A context the kernel still has must therefore stay
++   allocated until it is reaped: `usb_free_async()` marks such a context
++   `orphaned`, and `complete_locked()` frees it when it comes back. Once
++   `closing` is set nothing is reaped any more, so orphans can be freed.
++4. Synchronous transfers use `USBDEVFS_BULK`, never the completion queue.
++5. Calling `usb_close()` while another thread is still *entering* a call
++   on the same handle is the program's bug, as it is on Windows. Threads
++   already waiting in `usb_reap_async()` are handled.
++
++## Kernel behaviour relied on
++
++From `drivers/usb/core/devio.c` (checked against Linux 6.8):
++
++- Completions are queued per file. `REAPURBNDELAY` returns `-EAGAIN`
++  when the queue is empty, and `-ENODEV` once the device is gone and the
++  queue is empty; reaping is allowed after a disconnect.
++- `DISCARDURB` kills the URB synchronously (`usb_kill_urb()`), so it is on
++  the completion queue when the ioctl returns. It fails with `EINVAL` if
++  the URB is no longer pending.
++- `poll()` reports `POLLOUT` while the completion queue is not empty (for
++  a file opened for writing), `POLLHUP` once disconnected, and `POLLERR`
++  once the file has been dropped from the device.
++- Every request needs a file opened for writing; otherwise `EPERM`.
++- `USBDEVFS_BULK` unlocks the device while it waits, so other requests on
++  the same file proceed; it works on interrupt endpoints too; a timeout
++  of 0 means none; it returns `ETIMEDOUT`; it copies data back only on
++  success; its wait can only be interrupted by a fatal signal.
++- A bulk URB on an interrupt endpoint is turned into an interrupt
++  transfer; an interrupt URB on a bulk endpoint is refused with `EINVAL`.
++- `SETCONFIGURATION` fails with `EBUSY` while any interface has a driver,
++  and for the current configuration it resets the device's endpoints.
++- `DISCONNECT_CLAIM` with `EXCEPT_DRIVER "usbfs"` detaches any driver but
++  usbfs and claims the interface in one step.
++- Data and status reach the program's memory when a URB is reaped, not
++  when it completes.
++- `open()` of a device node resumes a suspended device.
++
++## Testing
++
++`tests/run.sh` builds the library, `tests/usbemu.c` and
++`tests/libusb0-test.c`, then runs each test in a fresh Wine prefix with
++the emulator preloaded. `usbemu.so` stands in for usbfs on a fake
++`/dev/bus/usb` holding four devices: an ANT USB-m stick that answers the
++ANT requests `ANT_DLL` makes, a receiver bound to `usbhid` (which must
++never be taken), a hub, and a device this user cannot write to. It
++logs what the devices see, and `run.sh` checks that log too: for
++instance, that listing touches no device and that `usbhid` is never
++detached.
++
++To test something new, add a function to `libusb0-test.c` and a `run`
++line to `run.sh`; emulator behaviour belongs in `usbemu.c`, next to the
++kernel code it copies. The tests pass on Wine 9.0 and 11.20.
++
++Real hardware beats an emulator. `src/lsusb-wine.c` is the quickest
++check that the library loads and lists your devices.
+diff --git a/README.md b/README.md
+index 7d36901..925cbcf 100644
+--- a/README.md
++++ b/README.md
+@@ -4,20 +4,124 @@ This is libusb-win32 for Wine.
+ Some Windows applications use libusb-win32. This Wine DLL allows to run
+ such Windows applications under Wine using native Linux USB stack.
+ 
+-Prerequisites: Wine with winegcc and winebuild
++It is a builtin `libusb0.dll` that talks to devices through usbfs
++(`/dev/bus/usb`), so no Windows driver is involved. It behaves the way
++libusb-win32 does on Windows, down to its timeouts, error codes and the
++`GetLastError()` values it leaves behind, because programs depend on
++those. Zwift's ANT+ support (through `ANT_DLL.dll`) is one program that
++works with it.
+ 
+-Building and installing:
++## Building
++
++You need gcc, make, and Wine's development files: winegcc, winebuild and
++the Windows headers.
++
++With the Wine that Debian or Ubuntu ship
++(`sudo apt install libwine-dev wine64-tools`):
++
++    $ cd src
++    $ make -f Makefile.x64 WINEGCC=/usr/lib/wine/winegcc WINEBUILD=/usr/lib/wine/winebuild
++
++With WineHQ's packages (`sudo apt install wine-staging-dev`, or the
++`-stable` or `-devel` one), point the build at them:
+ 
+     $ cd src
+-    $ make
+-    $ make install
++    $ make -f Makefile.x64 WINE_INCLUDE=/opt/wine-staging/include/wine/windows \
++          WINEGCC=/opt/wine-staging/bin/winegcc WINEBUILD=/opt/wine-staging/bin/winebuild
++
++That builds `libusb0.dll.so`, the library, and `libusb0.dll.fake`, its
++placeholder. `Makefile` builds a 32-bit library for 32-bit programs; it
++needs a 32-bit Wine that is not built in the new WoW64 mode, and has not
++been tested with current Wine.
++
++## Installing
++
++Wine loads a builtin DLL only if it finds a file of that name where
++Windows would look for it: in `system32` or next to the program. That
++file is the placeholder; the library itself is looked for in Wine's own
++folders, then in the folders listed in `WINEDLLPATH`.
++
++**Into Wine**, for every prefix. For Debian's or Ubuntu's Wine:
++
++    $ sudo make -f Makefile.x64 install-lib
++
++and for WineHQ's:
++
++    $ sudo make -f Makefile.x64 install-lib dlldir=/opt/wine-staging/lib/wine
++
++Wine puts the placeholder into a prefix when it creates the prefix or
++updates it, which it does after a Wine upgrade; `wineboot -u` updates an
++existing prefix now. (`install-dev` adds the import library that winegcc
++needs to build winelib programs such as `lsusb-wine`.)
++
++**Into one prefix**, without root:
++
++    $ mkdir -p ~/wine-dlls/x86_64-unix
++    $ cp libusb0.dll.so ~/wine-dlls/x86_64-unix/
++    $ cp libusb0.dll.fake "$WINEPREFIX/drive_c/windows/system32/libusb0.dll"
++    $ WINEDLLPATH=~/wine-dlls wine program.exe
++
++**If the program brings its own `libusb0.dll`**, as most do, Wine loads
++that one, and it cannot work without its Windows driver. Make Wine use
++the builtin instead, whatever file it finds:
++
++    $ wine reg add 'HKCU\Software\Wine\DllOverrides' /v libusb0 /d builtin /f
++
++or in `winecfg`, on the Libraries tab. To check which one is loaded:
++
++    $ WINEDEBUG=+loaddll wine program.exe 2>&1 | grep -i libusb0
++
++## Device access
++
++usbfs serves only those who may write to the device's node, so a Windows
++program only gets to see the devices your login can write to. A udev
++rule gives you a device; for an ANT USB-m stick (vendor `0fcf`, product
++`1009`), `/etc/udev/rules.d/70-libusb-wine.rules` would hold:
++
++    SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTR{idVendor}=="0fcf", ATTR{idProduct}=="1009", MODE="0660", TAG+="uaccess"
++
++`TAG+="uaccess"` hands the device to whoever is logged in at the screen,
++and only works in a file numbered below 73. Then run
++`sudo udevadm control --reload-rules` and plug the device in again.
++
++## How it treats devices
++
++- It lists the devices this user may open for writing, and no hubs:
++  what libusb-win32 lists is the devices bound to its driver, the ones a
++  program can use. Every listed device hangs off one virtual hub per
++  bus, as with libusb-win32.
++- It leaves kernel drivers alone. The exception is a short list of
++  devices that Linux gives a driver and Windows does not, so far the ANT
++  USB2 and USB-m sticks (`usb_serial_simple` binds them as serial
++  ports): when a program claims one of their interfaces, it is taken from
++  the kernel driver. Never from another program.
++- `usb_set_configuration()` for the configuration a device is already
++  in does nothing, as in libusb-win32.
++
++## Settings
++
++All are environment variables.
++
++| Variable | Effect |
++|---|---|
++| `USB_DEBUG=1`...`4` | messages on stderr, more with each level |
++| `LIBUSB0_ALL_DEVICES=1` | list every device, hubs and read-only ones too |
++| `LIBUSB0_DETACH_KERNEL_DRIVER=1` | take any claimed interface from its kernel driver |
++| `LIBUSB0_DETACH_KERNEL_DRIVER=0` | never take one, not even an ANT stick's |
++| `USB_DEVFS_PATH` | where usbfs is, if not in `/dev/bus/usb` |
++
++## What is missing
++
++These libusb-win32 functions are not there:
+ 
+-I didn't port following libusb-win32 functions to libusb-wine:
++ * usb_install_service_np, usb_uninstall_service_np, usb_install_driver_np,
++   usb_touch_inf_file_np, usb_install_needs_restart_np, usb_install_npA,
++   usb_install_npW: they install Windows drivers, which mean nothing here
++ * usb_isochronous_setup_async: no isochronous transfers
++ * usb_reset_ex
+ 
+- * usb_install_service_np
+- * usb_uninstall_service_np
+- * usb_install_driver_np
+- * usb_isochronous_setup_async
+- * usb_interrupt_setup_async
++## Testing
+ 
+-however, all Windows applications I tested with libusb-wine do not use them.
++`tests/run.sh` runs the tests under Wine against emulated devices, so it
++needs no hardware. [HACKING.md](HACKING.md) explains how the library
++works, and what to keep in mind when changing it.
+diff --git a/src/Makefile b/src/Makefile
+index f37d226..6983e5b 100644
+--- a/src/Makefile
++++ b/src/Makefile
+@@ -19,9 +19,11 @@ CFLAGS = -g -O2 -m32 \
+   -Wno-format-truncation \
+   -gdwarf-2 \
+   -gstrict-dwarf \
+-  -fno-omit-frame-pointer
++  -fno-omit-frame-pointer \
++  -Werror=missing-prototypes \
++  -Werror=implicit-function-declaration
+ 
+-LDFLAGS = -m32
++LDFLAGS = -m32 -lpthread
+ 
+ OBJS = linux.o error.o usb.o descriptors.o usb-wine.o
+ 
+@@ -32,7 +34,6 @@ WINEGCC = winegcc
+ WINEBUILD = winebuild
+ 
+ dlldir = /usr/lib/wine
+-fakedlldir = $(dlldir)/fakedlls
+ 
+ $(OBJS):%.o: %.c
+ 	$(CC) -c -o $@ $^ -I. -I$(WINE_INCLUDE) -D__WINESRC__ -D_REENTRANT $(CFLAGS)
+@@ -41,6 +42,9 @@ $(PROJ).dll.so $(PROJ).dll.fake: $(PROJ).spec $(OBJS)
+ 	$(WINEGCC) -o $@ -B$(WINEBUILD) -fasynchronous-unwind-tables -shared $(PROJ).spec \
+   $(OBJS) $(LDFLAGS)
+ 
++$(PROJ).a: $(PROJ).spec
++	$(WINEBUILD) -m32 -w --implib -o $@ --export $(PROJ).spec
++
+ $(PROJ).def: $(PROJ).spec
+ 	$(WINEBUILD) -w --def -o $@ --export $(PROJ).spec
+ 
+@@ -49,16 +53,24 @@ $(PROJ).cross.a: $(PROJ).spec
+ 
+ all: $(PROJ).dll.so $(PROJ).dll.fake
+ 
++# Wine 6.8 and later keep builtin DLLs in a folder per architecture: the
++# library in i386-unix, its placeholder in i386-windows. Wine copies
++# the placeholder into a prefix's system32 when it creates or updates the
++# prefix, and programs find the library only through that placeholder.
+ install install-lib:: $(PROJ).dll.so $(PROJ).dll.fake
+-	cp $(PROJ).dll.so $(DESTDIR)$(dlldir)/$(PROJ).dll.so
+-	cp $(PROJ).dll.fake $(DESTDIR)$(fakedlldir)/$(PROJ).dll
++	mkdir -p $(DESTDIR)$(dlldir)/i386-unix $(DESTDIR)$(dlldir)/i386-windows
++	cp $(PROJ).dll.so $(DESTDIR)$(dlldir)/i386-unix/$(PROJ).dll.so
++	cp $(PROJ).dll.fake $(DESTDIR)$(dlldir)/i386-windows/$(PROJ).dll
+ 
+-install install-dev:: $(PROJ).def
+-	cp $(PROJ).def $(DESTDIR)$(dlldir)/$(PROJ).def
++# the import library winegcc links winelib programs such as lsusb-wine with
++install install-dev:: $(PROJ).a
++	mkdir -p $(DESTDIR)$(dlldir)/i386-unix
++	cp $(PROJ).a $(DESTDIR)$(dlldir)/i386-unix/$(PROJ).a
+ 
+ uninstall::
+-	rm -f $(DESTDIR)$(dlldir)/$(PROJ).dll.so $(DESTDIR)$(fakedlldir)/$(PROJ).dll \
+-  $(DESTDIR)$(dlldir)/$(PROJ).def
++	rm -f $(DESTDIR)$(dlldir)/i386-unix/$(PROJ).dll.so \
++  $(DESTDIR)$(dlldir)/i386-windows/$(PROJ).dll \
++  $(DESTDIR)$(dlldir)/i386-unix/$(PROJ).a
+ 
+ clean::
+ 	rm -f *.def *.a *.o *.so *.fake *.exe
+diff --git a/src/Makefile.x64 b/src/Makefile.x64
+index e2a12bf..df1b693 100644
+--- a/src/Makefile.x64
++++ b/src/Makefile.x64
+@@ -19,9 +19,11 @@ CFLAGS = -g -O2 \
+   -Wno-format-truncation \
+   -gdwarf-2 \
+   -gstrict-dwarf \
+-  -fno-omit-frame-pointer
++  -fno-omit-frame-pointer \
++  -Werror=missing-prototypes \
++  -Werror=implicit-function-declaration
+ 
+-LDFLAGS =
++LDFLAGS = -lpthread
+ 
+ OBJS = linux.o error.o usb.o descriptors.o usb-wine.o
+ 
+@@ -32,7 +34,6 @@ WINEGCC = winegcc
+ WINEBUILD = winebuild
+ 
+ dlldir = /usr/lib/x86_64-linux-gnu/wine
+-fakedlldir = $(dlldir)/fakedlls
+ 
+ $(OBJS):%.o: %.c
+ 	$(CC) -c -o $@ $^ -I. -I$(WINE_INCLUDE) -D__WINESRC__ -D_REENTRANT $(CFLAGS)
+@@ -41,6 +42,9 @@ $(PROJ).dll.so $(PROJ).dll.fake: $(PROJ).spec $(OBJS)
+ 	$(WINEGCC) -o $@ -B$(WINEBUILD) -fasynchronous-unwind-tables -shared $(PROJ).spec \
+   $(OBJS) $(LDFLAGS)
+ 
++$(PROJ).a: $(PROJ).spec
++	$(WINEBUILD) -w --implib -o $@ --export $(PROJ).spec
++
+ $(PROJ).def: $(PROJ).spec
+ 	$(WINEBUILD) -w --def -o $@ --export $(PROJ).spec
+ 
+@@ -49,16 +53,24 @@ $(PROJ).cross.a: $(PROJ).spec
+ 
+ all: $(PROJ).dll.so $(PROJ).dll.fake
+ 
++# Wine 6.8 and later keep builtin DLLs in a folder per architecture: the
++# library in x86_64-unix, its placeholder in x86_64-windows. Wine copies
++# the placeholder into a prefix's system32 when it creates or updates the
++# prefix, and programs find the library only through that placeholder.
+ install install-lib:: $(PROJ).dll.so $(PROJ).dll.fake
+-	cp $(PROJ).dll.so $(DESTDIR)$(dlldir)/$(PROJ).dll.so
+-	cp $(PROJ).dll.fake $(DESTDIR)$(fakedlldir)/$(PROJ).dll
++	mkdir -p $(DESTDIR)$(dlldir)/x86_64-unix $(DESTDIR)$(dlldir)/x86_64-windows
++	cp $(PROJ).dll.so $(DESTDIR)$(dlldir)/x86_64-unix/$(PROJ).dll.so
++	cp $(PROJ).dll.fake $(DESTDIR)$(dlldir)/x86_64-windows/$(PROJ).dll
+ 
+-install install-dev:: $(PROJ).def
+-	cp $(PROJ).def $(DESTDIR)$(dlldir)/$(PROJ).def
++# the import library winegcc links winelib programs such as lsusb-wine with
++install install-dev:: $(PROJ).a
++	mkdir -p $(DESTDIR)$(dlldir)/x86_64-unix
++	cp $(PROJ).a $(DESTDIR)$(dlldir)/x86_64-unix/$(PROJ).a
+ 
+ uninstall::
+-	rm -f $(DESTDIR)$(dlldir)/$(PROJ).dll.so $(DESTDIR)$(fakedlldir)/$(PROJ).dll \
+-  $(DESTDIR)$(dlldir)/$(PROJ).def
++	rm -f $(DESTDIR)$(dlldir)/x86_64-unix/$(PROJ).dll.so \
++  $(DESTDIR)$(dlldir)/x86_64-windows/$(PROJ).dll \
++  $(DESTDIR)$(dlldir)/x86_64-unix/$(PROJ).a
+ 
+ clean::
+ 	rm -f *.def *.a *.o *.so *.fake
+diff --git a/src/descriptors.c b/src/descriptors.c
+index f24bbfa..2c67fc9 100644
+--- a/src/descriptors.c
++++ b/src/descriptors.c
+@@ -9,20 +9,27 @@
+ #include <stdio.h>
+ #include <string.h>
+ #include <stdint.h>
++#include <errno.h>
+ #include "usbi.h"
+ 
+-int usb_get_descriptor_by_endpoint(usb_dev_handle *udev, int ep,
++LIBUSB_API int usb_get_descriptor_by_endpoint(usb_dev_handle *udev, int ep,
+ 	unsigned char type, unsigned char index, void *buf, int size)
+ {
++  if (!buf || size < 0)
++    USB_ERROR_STR(-EINVAL, "usb_get_descriptor_by_endpoint: invalid buffer");
++
+   memset(buf, 0, size);
+ 
+   return usb_control_msg(udev, ep | USB_ENDPOINT_IN, USB_REQ_GET_DESCRIPTOR,
+                         (type << 8) + index, 0, buf, size, 1000);
+ }
+ 
+-int usb_get_descriptor(usb_dev_handle *udev, unsigned char type,
++LIBUSB_API int usb_get_descriptor(usb_dev_handle *udev, unsigned char type,
+ 	unsigned char index, void *buf, int size)
+ {
++  if (!buf || size < 0)
++    USB_ERROR_STR(-EINVAL, "usb_get_descriptor: invalid buffer");
++
+   memset(buf, 0, size);
+ 
+   return usb_control_msg(udev, USB_ENDPOINT_IN, USB_REQ_GET_DESCRIPTOR,
+diff --git a/src/error.c b/src/error.c
+index 9eff494..7570730 100644
+--- a/src/error.c
++++ b/src/error.c
+@@ -16,7 +16,7 @@ char usb_error_str[1024] = "";
+ int usb_error_errno = 0;
+ usb_error_type_t usb_error_type = USB_ERROR_TYPE_NONE;
+ 
+-const char *usb_strerror(void)
++LIBUSB_API const char *usb_strerror(void)
+ {
+   switch (usb_error_type) {
+   case USB_ERROR_TYPE_NONE:
+@@ -24,8 +24,9 @@ const char *usb_strerror(void)
+   case USB_ERROR_TYPE_STRING:
+     return usb_error_str;
+   case USB_ERROR_TYPE_ERRNO:
+-    if (usb_error_errno > -USB_ERROR_BEGIN)
+-      return strerror(usb_error_errno);
++    /* stored the way it is returned: negated */
++    if (usb_error_errno < 0 && usb_error_errno > -USB_ERROR_BEGIN)
++      return strerror(-usb_error_errno);
+     else
+       /* Any error we don't know falls under here */
+       return "Unknown error";
+diff --git a/src/error.h b/src/error.h
+index 173e6fd..39fc441 100644
+--- a/src/error.h
++++ b/src/error.h
+@@ -18,13 +18,25 @@ extern usb_error_type_t usb_error_type;
+ 	  return x; \
+ 	} while (0)
+ 
+-#define USB_ERROR_STR(x, format, args...) \
++/* Record an error message, without returning. */
++#define USB_ERROR_SET(format, args...) \
+ 	do { \
+ 	  usb_error_type = USB_ERROR_TYPE_STRING; \
+ 	  snprintf(usb_error_str, sizeof(usb_error_str) - 1, format, ## args); \
+           if (usb_debug >= 2) \
+             fprintf(stderr, "USB error: %s\n", usb_error_str); \
+-	  return x; \
++	} while (0)
++
++/*
++ * Record an error message and return x. x is evaluated first, so that
++ * -errno is still the errno of the call that failed, not whatever
++ * formatting or printing the message left behind.
++ */
++#define USB_ERROR_STR(x, format, args...) \
++	do { \
++	  int usb_error_ret = (x); \
++	  USB_ERROR_SET(format, ## args); \
++	  return usb_error_ret; \
+ 	} while (0)
+ 
+ #endif /* _ERROR_H_ */
+diff --git a/src/libusb0.spec b/src/libusb0.spec
+index 34f2ab0..eeec6eb 100644
+--- a/src/libusb0.spec
++++ b/src/libusb0.spec
+@@ -1,14 +1,14 @@
+ @ cdecl usb_open                       (ptr)
+ @ cdecl usb_close                      (ptr)
+-@ cdecl usb_get_string                 (ptr long long str long)
+-@ cdecl usb_get_string_simple          (ptr long str long)
++@ cdecl usb_get_string                 (ptr long long ptr long)
++@ cdecl usb_get_string_simple          (ptr long ptr long)
+ @ cdecl usb_get_descriptor_by_endpoint (ptr long long long ptr long)
+ @ cdecl usb_get_descriptor             (ptr long long ptr long)
+-@ cdecl usb_bulk_write                 (ptr long str long long)
+-@ cdecl usb_bulk_read                  (ptr long str long long)
+-@ cdecl usb_interrupt_write            (ptr long str long long)
+-@ cdecl usb_interrupt_read             (ptr long str long long)
+-@ cdecl usb_control_msg                (ptr long long long long str long long)
++@ cdecl usb_bulk_write                 (ptr long ptr long long)
++@ cdecl usb_bulk_read                  (ptr long ptr long long)
++@ cdecl usb_interrupt_write            (ptr long ptr long long)
++@ cdecl usb_interrupt_read             (ptr long ptr long long)
++@ cdecl usb_control_msg                (ptr long long long long ptr long long)
+ @ cdecl usb_set_configuration          (ptr long)
+ @ cdecl usb_claim_interface            (ptr long)
+ @ cdecl usb_release_interface          (ptr long)
+@@ -25,7 +25,9 @@
+ @ cdecl usb_get_busses                 ()
+ @ cdecl usb_get_version                ()
+ @ cdecl usb_bulk_setup_async           (ptr ptr long)
++@ cdecl usb_interrupt_setup_async      (ptr ptr long)
+ @ cdecl usb_submit_async               (ptr ptr long)
+ @ cdecl usb_reap_async                 (ptr long)
++@ cdecl usb_reap_async_nocancel        (ptr long)
+ @ cdecl usb_free_async                 (ptr)
+ @ cdecl usb_cancel_async               (ptr)
+diff --git a/src/linux.c b/src/linux.c
+index 0731c75..e8976b4 100644
+--- a/src/linux.c
++++ b/src/linux.c
+@@ -12,18 +12,115 @@
+ #include <stdio.h>
+ #include <fcntl.h>
+ #include <errno.h>
+-#include <sys/time.h>
++#include <limits.h>
++#include <poll.h>
++#include <pthread.h>
++#include <stdint.h>
++#include <time.h>
+ #include <dirent.h>
++#include <sys/eventfd.h>
++#include <sys/sysmacros.h>
++#include <linux/usbdevice_fs.h>
+ 
+ #include "linux.h"
+ #include "usbi.h"
++#include "usb-wine.h"
++
++/* linux.h declares the kernel's usbfs structures itself: check them */
++_Static_assert(sizeof(struct usb_urb) == sizeof(struct usbdevfs_urb), "usb_urb");
++_Static_assert(sizeof(struct usb_bulktransfer) == sizeof(struct usbdevfs_bulktransfer),
++	"usb_bulktransfer");
++_Static_assert(IOCTL_USB_SUBMITURB == USBDEVFS_SUBMITURB, "IOCTL_USB_SUBMITURB");
++_Static_assert(IOCTL_USB_DISCARDURB == USBDEVFS_DISCARDURB, "IOCTL_USB_DISCARDURB");
++_Static_assert(IOCTL_USB_REAPURBNDELAY == USBDEVFS_REAPURBNDELAY, "IOCTL_USB_REAPURBNDELAY");
++_Static_assert(IOCTL_USB_BULK == USBDEVFS_BULK, "IOCTL_USB_BULK");
++_Static_assert(IOCTL_USB_DISCONNECT_CLAIM == USBDEVFS_DISCONNECT_CLAIM,
++	"IOCTL_USB_DISCONNECT_CLAIM");
+ 
+-/* redefine linux ETIMEDOUT to match libusb-win32 ETIMEDOUT value */
+-#undef ETIMEDOUT
+-#define ETIMEDOUT 116
++/*
++ * libusb-win32's timeout error (from its error.h), the value Windows
++ * programs compare against. Linux's own ETIMEDOUT is 110.
++ */
++#define ETRANSFER_TIMEDOUT 116
++
++#define TRACE(level, format, args...) \
++	do { \
++	  if (usb_debug >= (level)) \
++	    fprintf(stderr, "libusb0: " format "\n", ## args); \
++	} while (0)
+ 
+ static char usb_path[PATH_MAX + 1] = "";
+ 
++/* LIBUSB0_ALL_DEVICES=1: list every device, not only the usable ones */
++static int list_all_devices;
++
++/*
++ * libusb-win32 sees no real hubs. It makes one up for each bus and hangs
++ * every device it lists off that (usb_os_determine_children() in its
++ * windows.c), and so does this when it lists only the usable devices. A
++ * bus is allocated together with its virtual hub, so freeing the bus
++ * frees both.
++ */
++#define MAX_DEVICES_PER_BUS	128	/* USB addresses go up to 127 */
++
++struct linux_bus {
++  struct usb_bus bus;		/* first: the rest of the library sees only this */
++  struct usb_device hub;
++  struct usb_device *children[MAX_DEVICES_PER_BUS];
++};
++
++/* per-device state for the asynchronous API, at the end of this file */
++static int async_open(usb_dev_handle *dev);
++static int async_close(usb_dev_handle *dev);
++
++/*
++ * libusb-win32 reports every failure as one of four errors
++ * (usb_win_error_to_errno() in its error.c): EINVAL, ETRANSFER_TIMEDOUT,
++ * ENOMEM and EIO. Windows programs were written against that set, so
++ * Linux's errors are folded into it.
++ */
++static int win_error(int err)
++{
++  switch (err) {
++  case EINVAL:
++    return -EINVAL;
++  case ENOMEM:
++    return -ENOMEM;
++  case ETIMEDOUT:
++    return -ETRANSFER_TIMEDOUT;
++  default:
++    return -EIO;
++  }
++}
++
++/* Timeouts run on CLOCK_MONOTONIC, so changing the clock cannot stretch them. */
++static void deadline_in(struct timespec *ts, int ms)
++{
++  clock_gettime(CLOCK_MONOTONIC, ts);
++  ts->tv_sec += ms / 1000;
++  ts->tv_nsec += (long)(ms % 1000) * 1000000L;
++  if (ts->tv_nsec >= 1000000000L) {
++    ts->tv_sec++;
++    ts->tv_nsec -= 1000000000L;
++  }
++}
++
++/* Milliseconds left until ts, rounded up so that a wait never ends early;
++   0 once ts has passed. */
++static int ms_left(const struct timespec *ts)
++{
++  struct timespec now;
++  long long ns;
++
++  clock_gettime(CLOCK_MONOTONIC, &now);
++  ns = (long long)(ts->tv_sec - now.tv_sec) * 1000000000LL
++     + (ts->tv_nsec - now.tv_nsec);
++  if (ns <= 0)
++    return 0;
++  ns = (ns + 999999) / 1000000;
++  return ns > INT_MAX ? INT_MAX : (int)ns;
++}
++
+ static int device_open(struct usb_device *dev)
+ {
+   char filename[PATH_MAX + 1];
+@@ -32,9 +129,9 @@ static int device_open(struct usb_device *dev)
+   snprintf(filename, sizeof(filename) - 1, "%s/%s/%s",
+     usb_path, dev->bus->dirname, dev->filename);
+ 
+-  fd = open(filename, O_RDWR);
++  fd = open(filename, O_RDWR | O_CLOEXEC);
+   if (fd < 0) {
+-    fd = open(filename, O_RDONLY);
++    fd = open(filename, O_RDONLY | O_CLOEXEC);
+     if (fd < 0)
+       USB_ERROR_STR(-errno, "failed to open %s: %s",
+ 	filename, strerror(errno));
+@@ -43,9 +140,67 @@ static int device_open(struct usb_device *dev)
+   return fd;
+ }
+ 
++/*
++ * The configuration the device is in, from the value the kernel keeps in
++ * sysfs: no bus traffic, just as libusb-win32 asks its driver for the
++ * cached value. Anything that is not a usbfs device node is asked with a
++ * GET_CONFIGURATION request instead. 0 when unconfigured or unknown, which
++ * is what libusb-win32 falls back to as well.
++ */
++static int active_configuration(int fd)
++{
++  struct usb_ctrltransfer ctrl;
++  unsigned char value = 0;
++  struct stat st;
++  char path[64], buf[16];
++  int f, n;
++
++  if (fstat(fd, &st) == 0 && S_ISCHR(st.st_mode)) {
++    snprintf(path, sizeof(path), "/sys/dev/char/%u:%u/bConfigurationValue",
++      major(st.st_rdev), minor(st.st_rdev));
++    f = open(path, O_RDONLY | O_CLOEXEC);
++    if (f >= 0) {
++      n = read(f, buf, sizeof(buf) - 1);
++      close(f);
++      if (n >= 0) {
++        buf[n] = 0;
++        return atoi(buf);
++      }
++    }
++  }
++
++  memset(&ctrl, 0, sizeof(ctrl));
++  ctrl.bRequestType = USB_ENDPOINT_IN;
++  ctrl.bRequest = USB_REQ_GET_CONFIGURATION;
++  ctrl.wLength = 1;
++  ctrl.timeout = 1000;
++  ctrl.data = &value;
++  if (ioctl(fd, IOCTL_USB_CONTROL, &ctrl) == 1)
++    return value;
++
++  return 0;
++}
++
+ int usb_os_open(usb_dev_handle *dev)
+ {
++  int ret;
++
++  /* libusb-win32's usb_open() fails when the device cannot be opened,
++     instead of handing out a handle on which every call fails */
+   dev->fd = device_open(dev->device);
++  if (dev->fd < 0)
++    return dev->fd;
++
++  ret = async_open(dev);
++  if (ret < 0) {
++    close(dev->fd);
++    dev->fd = -1;
++    return ret;
++  }
++
++  /* start in the configuration the device is in, as libusb-win32 does,
++     so that asking for that one changes nothing */
++  dev->config = active_configuration(dev->fd);
+ 
+   return 0;
+ }
+@@ -55,6 +210,15 @@ int usb_os_close(usb_dev_handle *dev)
+   if (dev->fd < 0)
+     return 0;
+ 
++  /* libusb-win32 releases the claimed interface on close */
++  if (dev->interface >= 0)
++    usb_release_interface(dev, dev->interface);
++
++  /* if a thread cannot be got out of usb_reap_async(), the file stays
++     open for it: see async_close() */
++  if (async_close(dev) < 0)
++    return 0;
++
+   if (close(dev->fd) == -1)
+     /* Failing trying to close a file really isn't an error, so return 0 */
+     USB_ERROR_STR(0, "tried to close device fd %d: %s", dev->fd,
+@@ -63,60 +227,143 @@ int usb_os_close(usb_dev_handle *dev)
+   return 0;
+ }
+ 
+-int usb_set_configuration(usb_dev_handle *dev, int configuration)
++LIBUSB_API int usb_set_configuration(usb_dev_handle *dev, int configuration)
+ {
+   int ret;
+ 
+-  /* detach kernel driver for windows program ( Stanson <me@stanson.ch > ) */
+-  usb_detach_kernel_driver_np(dev, 0);
++  if (!dev)
++    USB_ERROR_STR(-EINVAL, "could not set config %d: invalid device handle",
++      configuration);
++
++  /*
++   * As in libusb-win32: asking for the configuration the device is already
++   * in does nothing, and no interface may be claimed. Linux would reset
++   * the device's endpoints in the first case, and refuses with EBUSY while
++   * a kernel driver holds an interface. The old code here detached the
++   * kernel driver from interface 0 first, on any device a program merely
++   * tried to open.
++   */
++  if (dev->config == configuration)
++    return 0;
++  if (dev->interface >= 0)
++    USB_ERROR_STR(-EINVAL, "could not set config %d: an interface is claimed",
++      configuration);
+ 
+   ret = ioctl(dev->fd, IOCTL_USB_SETCONFIG, &configuration);
+   if (ret < 0)
+-    USB_ERROR_STR(-errno, "could not set config %d: %s", configuration,
++    USB_ERROR_STR(win_error(errno), "could not set config %d: %s", configuration,
+ 	strerror(errno));
+ 
+   dev->config = configuration;
++  dev->interface = -1;
++  dev->altsetting = -1;
+ 
+   return 0;
+ }
+ 
+-int usb_claim_interface(usb_dev_handle *dev, int interface)
++/*
++ * Devices that Linux gives a kernel driver and Windows does not: there,
++ * the libusb0 driver has them to itself. Claiming an interface of one of
++ * these takes it from its kernel driver, but never from another program
++ * that has it through usbfs.
++ *
++ * The list is short on purpose, because programs probe: ANT_DLL, which
++ * Zwift and other fitness programs use, claims interface 0 of every device
++ * it is shown just to see whether it can. LIBUSB0_DETACH_KERNEL_DRIVER=1
++ * extends the takeover to every device, and =0 turns it off.
++ */
++static const struct {
++  unsigned short vendor, product;
++} take_from_kernel[] = {
++  { 0x0fcf, 0x1008 },	/* Dynastream ANT USB2 stick: usb_serial_simple */
++  { 0x0fcf, 0x1009 },	/* Dynastream ANT USB-m stick: usb_serial_simple */
++};
++
++static int may_take_from_kernel(struct usb_device *dev)
+ {
+-  int ret;
++  const char *env = getenv("LIBUSB0_DETACH_KERNEL_DRIVER");
++  size_t i;
++
++  if (env && *env)
++    return atoi(env) != 0;
++  for (i = 0; i < sizeof(take_from_kernel) / sizeof(take_from_kernel[0]); i++)
++    if (dev->descriptor.idVendor == take_from_kernel[i].vendor &&
++        dev->descriptor.idProduct == take_from_kernel[i].product)
++      return 1;
++  return 0;
++}
++
++LIBUSB_API int usb_claim_interface(usb_dev_handle *dev, int interface)
++{
++  struct usb_disconnect_claim dc;
++  int ret, err;
++
++  if (!dev)
++    USB_ERROR_STR(-EINVAL, "could not claim interface %d: invalid device handle",
++      interface);
++
++  /* the checks libusb-win32 makes */
++  if (!dev->config)
++    USB_ERROR_STR(-EINVAL, "could not claim interface %d: device not configured",
++      interface);
++  if (dev->interface == interface)
++    return 0;
+ 
+   ret = ioctl(dev->fd, IOCTL_USB_CLAIMINTF, &interface);
++  err = errno;
++  if (ret < 0 && err == EBUSY && may_take_from_kernel(dev->device)) {
++    memset(&dc, 0, sizeof(dc));
++    dc.interface = interface;
++    dc.flags = USB_DISCONNECT_CLAIM_EXCEPT_DRIVER;
++    strcpy(dc.driver, "usbfs");
++    ret = ioctl(dev->fd, IOCTL_USB_DISCONNECT_CLAIM, &dc);
++    err = errno;
++    if (ret == 0)
++      TRACE(1, "took interface %d of %s/%s from its kernel driver", interface,
++            dev->bus->dirname, dev->device->filename);
++  }
+   if (ret < 0) {
+-    if (errno == EBUSY && usb_debug > 0)
+-      fprintf(stderr, "Check that you have permissions to write to %s/%s and, if you don't, that you set up hotplug (http://linux-hotplug.sourceforge.net/) correctly.\n", dev->bus->dirname, dev->device->filename);
+-
+-    USB_ERROR_STR(-errno, "could not claim interface %d: %s", interface,
+-	strerror(errno));
++    if (err == EBUSY)
++      TRACE(1, "interface %d of %s/%s is in use by a kernel driver or another program",
++            interface, dev->bus->dirname, dev->device->filename);
++    USB_ERROR_STR(win_error(err), "could not claim interface %d: %s", interface,
++	strerror(err));
+   }
+ 
+   dev->interface = interface;
++  dev->altsetting = 0;
+ 
+   return 0;
+ }
+ 
+-int usb_release_interface(usb_dev_handle *dev, int interface)
++LIBUSB_API int usb_release_interface(usb_dev_handle *dev, int interface)
+ {
+   int ret;
+ 
++  if (!dev)
++    USB_ERROR_STR(-EINVAL, "could not release intf %d: invalid device handle",
++      interface);
++
+   ret = ioctl(dev->fd, IOCTL_USB_RELEASEINTF, &interface);
+   if (ret < 0)
+-    USB_ERROR_STR(-errno, "could not release intf %d: %s", interface,
++    USB_ERROR_STR(win_error(errno), "could not release intf %d: %s", interface,
+     	strerror(errno));
+ 
+   dev->interface = -1;
++  dev->altsetting = -1;
+ 
+   return 0;
+ }
+ 
+-int usb_set_altinterface(usb_dev_handle *dev, int alternate)
++LIBUSB_API int usb_set_altinterface(usb_dev_handle *dev, int alternate)
+ {
+   int ret;
+   struct usb_setinterface setintf;
+ 
++  if (!dev)
++    USB_ERROR_STR(-EINVAL, "could not set alt intf %d: invalid device handle",
++      alternate);
++
+   if (dev->interface < 0)
+     USB_ERROR(-EINVAL);
+ 
+@@ -125,7 +372,7 @@ int usb_set_altinterface(usb_dev_handle *dev, int alternate)
+ 
+   ret = ioctl(dev->fd, IOCTL_USB_SETINTF, &setintf);
+   if (ret < 0)
+-    USB_ERROR_STR(-errno, "could not set alt intf %d/%d: %s",
++    USB_ERROR_STR(win_error(errno), "could not set alt intf %d/%d: %s",
+ 	dev->interface, alternate, strerror(errno));
+ 
+   dev->altsetting = alternate;
+@@ -134,19 +381,20 @@ int usb_set_altinterface(usb_dev_handle *dev, int alternate)
+ }
+ 
+ /*
+- * Linux usbfs has a limit of one page size for synchronous bulk read/write.
+- * 4096 is the most portable maximum we can do for now.
+- * Linux usbfs has a limit of 16KB for the URB interface. We use this now
+- * to get better performance for USB 2.0 devices.
++ * Older kernels refuse a synchronous transfer of more than 16 KB, so
++ * bigger ones go in pieces.
+  */
+ #define MAX_READ_WRITE	(16 * 1024)
+ 
+-int usb_control_msg(usb_dev_handle *dev, int requesttype, int request,
++LIBUSB_API int usb_control_msg(usb_dev_handle *dev, int requesttype, int request,
+ 	int value, int index, char *bytes, int size, int timeout)
+ {
+   struct usb_ctrltransfer ctrl;
+   int ret;
+ 
++  if (!dev)
++    USB_ERROR_STR(-EINVAL, "error sending control message: invalid device handle");
++
+   ctrl.bRequestType = requesttype;
+   ctrl.bRequest = request;
+   ctrl.wValue = value;
+@@ -158,169 +406,94 @@ int usb_control_msg(usb_dev_handle *dev, int requesttype, int request,
+ 
+   ret = ioctl(dev->fd, IOCTL_USB_CONTROL, &ctrl);
+   if (ret < 0)
+-    USB_ERROR_STR(-errno, "error sending control message: %s", strerror(errno));
++    USB_ERROR_STR(win_error(errno), "error sending control message: %s",
++	strerror(errno));
+ 
+   return ret;
+ }
+ 
+-#define URB_USERCONTEXT_COOKIE		((void *)0x1)
+-
+-/* Reading and writing are the same except for the endpoint */
+-static int usb_urb_transfer(usb_dev_handle *dev, int ep, int urbtype,
+-	char *bytes, int size, int timeout)
++/*
++ * The four synchronous transfers. libusb-win32 does them all alike,
++ * whatever the type of the endpoint, and so does the kernel's blocking
++ * USBDEVFS_BULK, which picks bulk or interrupt from the endpoint. The old
++ * code here submitted interrupt URBs for usb_interrupt_read/write(), which
++ * the kernel refuses on bulk endpoints.
++ *
++ * USBDEVFS_BULK also stays out of the URB completion queue, so it can
++ * neither take nor lose a completion that belongs to an asynchronous
++ * request another thread has pending. The old code reaped from that
++ * shared queue, which broke programs that keep a read pending while they
++ * write.
++ *
++ * As in libusb-win32, a timeout of 0 (or less) means no timeout.
++ */
++static int usb_sync_transfer(usb_dev_handle *dev, int ep, char *bytes,
++	int size, int timeout)
+ {
+-  struct usb_urb urb;
+-  int bytesdone = 0, requested;
+-  struct timeval tv, tv_ref, tv_now;
+-  struct usb_urb *context;
+-  int ret, waiting;
++  struct usb_bulktransfer bulk;
++  struct timespec deadline;
++  int done = 0, requested, ret;
+ 
+-  /*
+-   * HACK: The use of urb.usercontext is a hack to get threaded applications
+-   * sort of working again. Threaded support is still not recommended, but
+-   * this should allow applications to work in the common cases. Basically,
+-   * if we get the completion for an URB we're not waiting for, then we update
+-   * the usercontext pointer to 1 for the other threads URB and it will see
+-   * the change after it wakes up from the the timeout. Ugly, but it works.
+-   */
+-
+-  /*
+-   * Get actual time, and add the timeout value. The result is the absolute
+-   * time where we have to quit waiting for an message.
+-   */
+-  gettimeofday(&tv_ref, NULL);
+-  tv_ref.tv_sec = tv_ref.tv_sec + timeout / 1000;
+-  tv_ref.tv_usec = tv_ref.tv_usec + (timeout % 1000) * 1000;
++  if (!dev)
++    USB_ERROR_STR(-EINVAL, "transfer on ep 0x%02x: invalid device handle", ep);
+ 
+-  if (tv_ref.tv_usec > 1000000) {
+-    tv_ref.tv_usec -= 1000000;
+-    tv_ref.tv_sec++;
+-  }
++  if (timeout > 0)
++    deadline_in(&deadline, timeout);
+ 
+   do {
+-    fd_set writefds;
+-
+-    requested = size - bytesdone;
++    requested = size - done;
+     if (requested > MAX_READ_WRITE)
+       requested = MAX_READ_WRITE;
+ 
+-    urb.type = urbtype;
+-    urb.endpoint = ep;
+-    urb.flags = 0;
+-    urb.buffer = bytes + bytesdone;
+-    urb.buffer_length = requested;
+-    urb.signr = 0;
+-    urb.actual_length = 0;
+-    urb.number_of_packets = 0;	/* don't do isochronous yet */
+-    urb.usercontext = NULL;
+-
+-    ret = ioctl(dev->fd, IOCTL_USB_SUBMITURB, &urb);
+-    if (ret < 0) {
+-      USB_ERROR_STR(-errno, "error submitting URB: %s", strerror(errno));
+-      return ret;
+-    }
+-
+-    FD_ZERO(&writefds);
+-    FD_SET(dev->fd, &writefds);
+-
+-restart:
+-    waiting = 1;
+-    context = NULL;
+-    while (!urb.usercontext && ((ret = ioctl(dev->fd, IOCTL_USB_REAPURBNDELAY, &context)) == -1) && waiting) {
+-      tv.tv_sec = 0;
+-      tv.tv_usec = 1000; // 1 msec
+-      select(dev->fd + 1, NULL, &writefds, NULL, &tv); //sub second wait
+-
+-      if (timeout) {
+-        /* compare with actual time, as the select timeout is not that precise */
+-        gettimeofday(&tv_now, NULL);
+-
+-        if ((tv_now.tv_sec > tv_ref.tv_sec) ||
+-            ((tv_now.tv_sec == tv_ref.tv_sec) && (tv_now.tv_usec >= tv_ref.tv_usec)))
+-          waiting = 0;
+-      }
+-    }
+-
+-    if (context && context != &urb) {
+-      context->usercontext = URB_USERCONTEXT_COOKIE;
+-      /* We need to restart since we got a successful URB, but not ours */
+-      goto restart;
++    bulk.ep = ep;
++    bulk.len = requested;
++    bulk.data = bytes + done;
++    bulk.timeout = 0;			/* the kernel's "no timeout" */
++    if (timeout > 0) {
++      bulk.timeout = ms_left(&deadline);
++      if (!bulk.timeout)
++        USB_ERROR_STR(-ETRANSFER_TIMEDOUT, "transfer on ep 0x%02x timed out", ep);
+     }
+ 
+-    /*
+-     * If there was an error, that wasn't EAGAIN (no completion), then
+-     * something happened during the reaping and we should return that
+-     * error now
+-     */
+-    if (ret < 0 && !urb.usercontext && errno != EAGAIN)
+-      USB_ERROR_STR(-errno, "error reaping URB: %s", strerror(errno));
+-
+-    bytesdone += urb.actual_length;
+-  } while ((ret == 0 || urb.usercontext) && bytesdone < size && urb.actual_length == requested);
+-
+-  /* If the URB didn't complete in success or error, then let's unlink it */
+-  if (ret < 0 && !urb.usercontext) {
+-    int rc;
+-
+-    if (!waiting)
+-      rc = -ETIMEDOUT;
+-    else
+-      rc = urb.status;
+-
+-    ret = ioctl(dev->fd, IOCTL_USB_DISCARDURB, &urb);
+-    if (ret < 0 && errno != EINVAL && usb_debug >= 1)
+-      fprintf(stderr, "error discarding URB: %s", strerror(errno));
+-
+-    /*
+-     * When the URB is unlinked, it gets moved to the completed list and
+-     * then we need to reap it or else the next time we call this function,
+-     * we'll get the previous completion and exit early
+-     */
+-    ioctl(dev->fd, IOCTL_USB_REAPURB, &context);
++    ret = ioctl(dev->fd, IOCTL_USB_BULK, &bulk);
++    if (ret < 0)
++      USB_ERROR_STR(win_error(errno), "transfer on ep 0x%02x failed: %s", ep,
++	strerror(errno));
+ 
+-    return rc;
+-  }
++    done += ret;
++  } while (ret == requested && done < size);
+ 
+-  return bytesdone;
++  return done;
+ }
+ 
+-int usb_bulk_write(usb_dev_handle *dev, int ep, char *bytes, int size,
++LIBUSB_API int usb_bulk_write(usb_dev_handle *dev, int ep, char *bytes, int size,
+ 	int timeout)
+ {
+   /* Ensure the endpoint address is correct */
+-  return usb_urb_transfer(dev, ep, USB_URB_TYPE_BULK, bytes, size,
+-		timeout);
++  return usb_sync_transfer(dev, ep, bytes, size, timeout);
+ }
+ 
+-int usb_bulk_read(usb_dev_handle *dev, int ep, char *bytes, int size,
++LIBUSB_API int usb_bulk_read(usb_dev_handle *dev, int ep, char *bytes, int size,
+ 	int timeout)
+ {
+   /* Ensure the endpoint address is correct */
+   ep |= USB_ENDPOINT_IN;
+-  return usb_urb_transfer(dev, ep, USB_URB_TYPE_BULK, bytes, size,
+-		timeout);
++  return usb_sync_transfer(dev, ep, bytes, size, timeout);
+ }
+ 
+-/*
+- * FIXME: Packetize large buffers here. 2.4 HCDs (atleast, haven't checked
+- * 2.5 HCDs yet) don't handle multi-packet Interrupt transfers. So we need
+- * to lookup the endpoint packet size and packetize appropriately here.
+- */
+-int usb_interrupt_write(usb_dev_handle *dev, int ep, char *bytes, int size,
+-	int timeout)
++LIBUSB_API int usb_interrupt_write(usb_dev_handle *dev, int ep, char *bytes,
++	int size, int timeout)
+ {
+   /* Ensure the endpoint address is correct */
+-  return usb_urb_transfer(dev, ep, USB_URB_TYPE_INTERRUPT, bytes, size,
+-		timeout);
++  return usb_sync_transfer(dev, ep, bytes, size, timeout);
+ }
+ 
+-int usb_interrupt_read(usb_dev_handle *dev, int ep, char *bytes, int size,
+-	int timeout)
++LIBUSB_API int usb_interrupt_read(usb_dev_handle *dev, int ep, char *bytes,
++	int size, int timeout)
+ {
+   /* Ensure the endpoint address is correct */
+   ep |= USB_ENDPOINT_IN;
+-  return usb_urb_transfer(dev, ep, USB_URB_TYPE_INTERRUPT, bytes, size,
+-		timeout);
++  return usb_sync_transfer(dev, ep, bytes, size, timeout);
+ }
+ 
+ int usb_os_find_busses(struct usb_bus **busses)
+@@ -329,12 +502,19 @@ int usb_os_find_busses(struct usb_bus **busses)
+   DIR *dir;
+   struct dirent *entry;
+ 
++  /* no USB at all, as in a container: no busses, which is no error */
++  if (!usb_path[0]) {
++    *busses = NULL;
++    return 0;
++  }
++
+   dir = opendir(usb_path);
+   if (!dir)
+     USB_ERROR_STR(-errno, "couldn't opendir(%s): %s", usb_path,
+ 	strerror(errno));
+ 
+   while ((entry = readdir(dir)) != NULL) {
++    struct linux_bus *lbus;
+     struct usb_bus *bus;
+ 
+     /* Skip anything starting with a . */
+@@ -348,11 +528,12 @@ int usb_os_find_busses(struct usb_bus **busses)
+       continue;
+     }
+ 
+-    bus = malloc(sizeof(*bus));
+-    if (!bus)
++    lbus = calloc(1, sizeof(*lbus));
++    if (!lbus) {
++      closedir(dir);
+       USB_ERROR(-ENOMEM);
+-
+-    memset((void *)bus, 0, sizeof(*bus));
++    }
++    bus = &lbus->bus;
+ 
+     strncpy(bus->dirname, entry->d_name, sizeof(bus->dirname) - 1);
+     bus->dirname[sizeof(bus->dirname) - 1] = 0;
+@@ -389,15 +570,17 @@ int usb_os_find_devices(struct usb_bus *bus, struct usb_device **devices)
+     char filename[PATH_MAX + 1];
+     struct usb_device *dev;
+     struct usb_connectinfo connectinfo;
+-    int i, fd, ret;
++    int i, fd, ret, writable;
+ 
+     /* Skip anything starting with a . */
+     if (entry->d_name[0] == '.')
+       continue;
+ 
+     dev = malloc(sizeof(*dev));
+-    if (!dev)
++    if (!dev) {
++      closedir(dir);
+       USB_ERROR(-ENOMEM);
++    }
+ 
+     memset((void *)dev, 0, sizeof(*dev));
+ 
+@@ -407,9 +590,10 @@ int usb_os_find_devices(struct usb_bus *bus, struct usb_device **devices)
+     dev->filename[sizeof(dev->filename) - 1] = 0;
+ 
+     snprintf(filename, sizeof(filename) - 1, "%s/%s", dirpath, entry->d_name);
+-    fd = open(filename, O_RDWR);
++    fd = open(filename, O_RDWR | O_CLOEXEC);
++    writable = fd >= 0;
+     if (fd < 0) {
+-      fd = open(filename, O_RDONLY);
++      fd = open(filename, O_RDONLY | O_CLOEXEC);
+       if (fd < 0) {
+         if (usb_debug >= 2)
+           fprintf(stderr, "usb_os_find_devices: Couldn't open %s\n",
+@@ -425,11 +609,13 @@ int usb_os_find_devices(struct usb_bus *bus, struct usb_device **devices)
+     if (ret < 0) {
+       if (usb_debug)
+         fprintf(stderr, "usb_os_find_devices: couldn't get connect info\n");
++      /* refused on a read-only file; usbfs names the node after it */
++      dev->devnum = atoi(entry->d_name);
+     } else
+       dev->devnum = connectinfo.devnum;
+ 
+     ret = read(fd, (void *)device_desc, DEVICE_DESC_LENGTH);
+-    if (ret < 0) {
++    if (ret < DEVICE_DESC_LENGTH) {
+       if (usb_debug)
+         fprintf(stderr, "usb_os_find_devices: Couldn't read descriptor\n");
+ 
+@@ -445,6 +631,24 @@ int usb_os_find_devices(struct usb_bus *bus, struct usb_device **devices)
+      */
+     usb_parse_descriptor(device_desc, "bbWbbbbWWWbbbb", &dev->descriptor);
+ 
++    /*
++     * libusb-win32 lists only the devices bound to its driver, the ones a
++     * program can use. List the same kind here: devices this user may open
++     * for writing (usbfs refuses every request on a read-only file), and
++     * no hubs. Programs probe what they are shown -- ANT_DLL opens,
++     * configures and claims every device -- and this keeps them off the
++     * rest. LIBUSB0_ALL_DEVICES=1 lists everything.
++     */
++    if (!list_all_devices &&
++        (!writable || dev->descriptor.bDeviceClass == USB_CLASS_HUB)) {
++      if (usb_debug >= 2)
++        fprintf(stderr, "usb_os_find_devices: Skipping %s on %s (%04x:%04x, %s)\n",
++		dev->filename, bus->dirname, dev->descriptor.idVendor,
++		dev->descriptor.idProduct, writable ? "a hub" : "not writable");
++      free(dev);
++      goto err;
++    }
++
+     LIST_ADD(fdev, dev);
+ 
+     if (usb_debug >= 2)
+@@ -487,6 +691,14 @@ int usb_os_find_devices(struct usb_bus *bus, struct usb_device **devices)
+ 
+       usb_parse_descriptor(buffer, "bbw", &config);
+ 
++      /* a shorter one would make the copy below overrun bigbuffer */
++      if (config.wTotalLength < 8) {
++        if (usb_debug >= 1)
++          fprintf(stderr, "Config descriptor too short (wTotalLength %d)\n",
++                  config.wTotalLength);
++        goto err;
++      }
++
+       bigbuffer = malloc(config.wTotalLength);
+       if (!bigbuffer) {
+         if (usb_debug >= 1)
+@@ -538,6 +750,30 @@ int usb_os_determine_children(struct usb_bus *bus)
+   struct usb_ioctl command;
+   int ret, i, i1;
+ 
++  if (!list_all_devices) {
++    struct linux_bus *lbus = (struct linux_bus *)bus;
++    struct usb_device *hub = &lbus->hub;
++
++    /* the device descriptor libusb-win32 gives its virtual hub */
++    strcpy(hub->filename, "virtual-hub");
++    hub->bus = bus;
++    hub->descriptor.bLength = USB_DT_DEVICE_SIZE;
++    hub->descriptor.bDescriptorType = USB_DT_DEVICE;
++    hub->descriptor.bcdUSB = 0x0200;
++    hub->descriptor.bDeviceClass = USB_CLASS_HUB;
++    hub->descriptor.bMaxPacketSize0 = 64;
++    hub->descriptor.bcdDevice = 0x0100;
++
++    hub->children = lbus->children;
++    hub->num_children = 0;
++    for (dev = bus->devices; dev && hub->num_children < MAX_DEVICES_PER_BUS;
++         dev = dev->next)
++      hub->children[hub->num_children++] = dev;
++
++    bus->root_dev = hub;
++    return 0;
++  }
++
+   /* Create a list of devices first */
+   memset(devices, 0, sizeof(devices));
+   for (dev = bus->devices; dev; dev = dev->next)
+@@ -549,6 +785,10 @@ int usb_os_determine_children(struct usb_bus *bus)
+     struct usb_hub_portinfo portinfo;
+     int fd;
+ 
++    /* only hubs have children: leave the other devices alone */
++    if (dev->descriptor.bDeviceClass != USB_CLASS_HUB)
++      continue;
++
+     fd = device_open(dev);
+     if (fd < 0)
+       continue;
+@@ -571,9 +811,10 @@ int usb_os_determine_children(struct usb_bus *bus)
+       continue;
+     }
+ 
++    /* ports whose device is not listed are left out */
+     dev->num_children = 0;
+     for (i = 0; i < portinfo.numports; i++)
+-      if (portinfo.port[i])
++      if (portinfo.port[i] && devices[portinfo.port[i]])
+         dev->num_children++;
+ 
+     /* Free any old children first */
+@@ -591,7 +832,7 @@ int usb_os_determine_children(struct usb_bus *bus)
+     }
+ 
+     for (i = 0, i1 = 0; i < portinfo.numports; i++) {
+-      if (!portinfo.port[i])
++      if (!portinfo.port[i] || !devices[portinfo.port[i]])
+         continue;
+ 
+       dev->children[i1++] = devices[portinfo.port[i]];
+@@ -641,6 +882,10 @@ static int check_usb_vfs(const char *dirname)
+ 
+ void usb_os_init(void)
+ {
++  const char *all = getenv("LIBUSB0_ALL_DEVICES");
++
++  list_all_devices = all && atoi(all) != 0;
++
+   /* Find the path to the virtual filesystem */
+   if (getenv("USB_DEVFS_PATH")) {
+     if (check_usb_vfs(getenv("USB_DEVFS_PATH"))) {
+@@ -669,42 +914,51 @@ void usb_os_init(void)
+   }
+ }
+ 
+-int usb_resetep(usb_dev_handle *dev, unsigned int ep)
++LIBUSB_API int usb_resetep(usb_dev_handle *dev, unsigned int ep)
+ {
+   int ret;
+ 
++  if (!dev)
++    USB_ERROR_STR(-EINVAL, "could not reset ep %d: invalid device handle", ep);
++
+   ret = ioctl(dev->fd, IOCTL_USB_RESETEP, &ep);
+   if (ret)
+-    USB_ERROR_STR(-errno, "could not reset ep %d: %s", ep,
++    USB_ERROR_STR(win_error(errno), "could not reset ep %d: %s", ep,
+     	strerror(errno));
+ 
+   return 0;
+ }
+ 
+-int usb_clear_halt(usb_dev_handle *dev, unsigned int ep)
++LIBUSB_API int usb_clear_halt(usb_dev_handle *dev, unsigned int ep)
+ {
+   int ret;
+ 
++  if (!dev)
++    USB_ERROR_STR(-EINVAL, "could not clear/halt ep %d: invalid device handle", ep);
++
+   ret = ioctl(dev->fd, IOCTL_USB_CLEAR_HALT, &ep);
+   if (ret)
+-    USB_ERROR_STR(-errno, "could not clear/halt ep %d: %s", ep,
++    USB_ERROR_STR(win_error(errno), "could not clear/halt ep %d: %s", ep,
+     	strerror(errno));
+ 
+   return 0;
+ }
+ 
+-int usb_reset(usb_dev_handle *dev)
++LIBUSB_API int usb_reset(usb_dev_handle *dev)
+ {
+   int ret;
+ 
++  if (!dev)
++    USB_ERROR_STR(-EINVAL, "could not reset: invalid device handle");
++
+   ret = ioctl(dev->fd, IOCTL_USB_RESET, NULL);
+   if (ret)
+-     USB_ERROR_STR(-errno, "could not reset: %s", strerror(errno));
++     USB_ERROR_STR(win_error(errno), "could not reset: %s", strerror(errno));
+ 
+   return 0;
+ }
+ 
+-int usb_get_driver_np(usb_dev_handle *dev, int interface, char *name,
++LIBUSB_API int usb_get_driver_np(usb_dev_handle *dev, int interface, char *name,
+ 	unsigned int namelen)
+ {
+   struct usb_getdriver getdrv;
+@@ -721,7 +975,7 @@ int usb_get_driver_np(usb_dev_handle *dev, int interface, char *name,
+   return 0;
+ }
+ 
+-int usb_detach_kernel_driver_np(usb_dev_handle *dev, int interface)
++LIBUSB_API int usb_detach_kernel_driver_np(usb_dev_handle *dev, int interface)
+ {
+   struct usb_ioctl command;
+   int ret;
+@@ -738,173 +992,582 @@ int usb_detach_kernel_driver_np(usb_dev_handle *dev, int interface)
+   return 0;
+ }
+ 
++/* ------------------------------------------------------------------------
++ * Asynchronous transfers
++ *
++ * libusb-win32 builds its asynchronous API on overlapped I/O:
++ * usb_submit_async() starts a driver request, usb_reap_async() waits for
++ * its event with WaitForSingleObject() and collects the result with
++ * GetOverlappedResult(). What follows gives Windows programs the same
++ * behaviour:
++ *
++ * - The timeout is WaitForSingleObject()'s: 0 checks without waiting, and
++ *   a negative one (INFINITE) waits for as long as it takes. When it runs
++ *   out, usb_reap_async() cancels the request and usb_reap_async_nocancel()
++ *   leaves it running; both return -ETRANSFER_TIMEDOUT.
++ * - A finished request stays finished: reaping it again gives the same
++ *   result, until the context is submitted again.
++ * - usb_cancel_async() aborts every request on the context's endpoint, as
++ *   libusb-win32's ABORT_ENDPOINT does, and returns once they have
++ *   stopped. They then reap as -ETRANSFER_TIMEDOUT.
++ * - A failed reap leaves a Win32 error for GetLastError(), as
++ *   GetOverlappedResult() would: ERROR_OPERATION_ABORTED for a request
++ *   that was cancelled or lost to an unplug, ERROR_GEN_FAILURE when the
++ *   transfer itself failed. After a plain timeout Windows leaves whatever
++ *   error was there before; this sets ERROR_SEM_TIMEOUT instead, because a
++ *   stale ERROR_OPERATION_ABORTED makes ANT_DLL think the stick is gone.
++ * - usb_close() ends whatever is still pending as aborted, as closing the
++ *   file handle does on Windows, and wakes the threads waiting on it.
++ *
++ * usbfs keeps one completion queue per open file: whoever reaps gets the
++ * next finished URB, whichever thread submitted it. So all reaping is done
++ * by drain_locked(), under the device's lock, which files every result
++ * with the request it belongs to. Threads waiting for a result take turns
++ * to sleep in poll() on the device; see wait_for().
++ */
+ 
+-// -------------------------------------------------------------------------------
+-// this async functions added by some person who'd like to remain anonymous
+-// It was necessary to make Aerodrums application run under wine.
+-
+-typedef struct {
+-	usb_dev_handle *dev;
+-	char *bytes;
+-	int size;
+-	struct usb_urb urb;
+-	int reaped;
+-} usb_context_t;
+-
+-static int _usb_setup_async(usb_dev_handle *dev, void **context,
+-                            int urbtype,
+-                            unsigned char ep, int pktsize)
++struct usb_async;
++
++/* Per-device state, in usb_dev_handle.impl_info */
++struct linux_handle {
++  int fd;			/* the device, as in dev->fd */
++  pthread_mutex_t lock;		/* guards all of this and every request */
++  pthread_cond_t cond;		/* broadcast when results are filed, when
++				   the thread in poll() leaves it, on close */
++  int wake_fd;			/* eventfd that wakes the thread in poll() */
++  int polling;			/* a thread is in poll() on fd */
++  int waiters;			/* threads inside wait_for() */
++  int gone;			/* the device has been unplugged */
++  int closing;			/* usb_close() is under way; nobody reaps */
++  struct usb_async *requests;	/* every context set up on the device */
++};
++
++enum { ASYNC_IDLE, ASYNC_PENDING, ASYNC_DONE };
++
++/* What a libusb-win32 context points to */
++struct usb_async {
++  struct usb_urb urb;		/* the kernel names a finished URB by address */
++  usb_dev_handle *dev;		/* NULL once the device is closed */
++  struct usb_async *next;
++  unsigned char ep;
++  int state;
++  int result;			/* bytes transferred, or a negative error */
++  unsigned int last_error;	/* for GetLastError() when result < 0 */
++  int orphaned;			/* freed by the program while still pending */
++};
++
++static struct linux_handle *handle_of(usb_dev_handle *dev)
+ {
+-	usb_context_t **c = (usb_context_t **)context;
+-
+-	/* Any error checks required here? */
++  return dev ? dev->impl_info : NULL;
++}
+ 
+-	*c = malloc(sizeof(usb_context_t));
++static void unlink_request(struct linux_handle *h, struct usb_async *c)
++{
++  struct usb_async **p;
+ 
+-	if (!*c) {
+-		USB_ERROR_STR(-errno, "memory allocation error: %s\n", strerror(errno));
+-		return -ENOMEM;
+-	}
++  for (p = &h->requests; *p; p = &(*p)->next)
++    if (*p == c) {
++      *p = c->next;
++      break;
++    }
++  c->next = NULL;
++}
+ 
+-	memset(*c, 0, sizeof(usb_context_t));
++static void finish(struct usb_async *c, int result, unsigned int last_error)
++{
++  c->state = ASYNC_DONE;
++  c->result = result;
++  c->last_error = last_error;
++}
+ 
+-	(*c)->dev = dev;
+-	(*c)->urb.type = urbtype;
+-	(*c)->urb.endpoint = ep;
+-	(*c)->urb.flags = 0;
+-	(*c)->urb.signr = 0;
+-	(*c)->urb.actual_length = 0;
+-	(*c)->urb.number_of_packets = 0;	/* don't do isochronous yet */
+-	(*c)->urb.usercontext = NULL;
++/* Wake every thread waiting on the device, the one in poll() included. */
++static void wake_locked(struct linux_handle *h)
++{
++  static const uint64_t one = 1;
+ 
+-	return 0;
++  pthread_cond_broadcast(&h->cond);
++  if (h->polling && write(h->wake_fd, &one, sizeof(one)) < 0) {
++    /* the count is already non-zero: the poller is waking up anyway */
++  }
+ }
+ 
+-int usb_bulk_setup_async(usb_dev_handle *dev, void **context, unsigned char ep)
++/*
++ * File a finished URB the way libusb-win32 reports a finished request.
++ * Data that arrived is delivered, even when the request was then cut
++ * short. A request that was cancelled, or lost when the device went away,
++ * fails on Windows with ERROR_OPERATION_ABORTED, which libusb-win32
++ * returns as -ETRANSFER_TIMEDOUT; ANT_DLL checks for exactly that pair.
++ */
++static void complete_locked(struct linux_handle *h, struct usb_async *c)
+ {
+-	return _usb_setup_async(dev, context, USB_URB_TYPE_BULK, ep, 0);
++  int status = c->urb.status, length = c->urb.actual_length;
++
++  if (status == 0 || length > 0)
++    finish(c, length, 0);
++  else if (status == -ENOENT || status == -ECONNRESET ||
++           status == -ESHUTDOWN || status == -ENODEV)
++    finish(c, -ETRANSFER_TIMEDOUT, USBWINE_ERROR_OPERATION_ABORTED);
++  else
++    finish(c, -EIO, USBWINE_ERROR_GEN_FAILURE);
++
++  TRACE(4, "ep 0x%02x: request finished, status %d, %d bytes", c->ep,
++        status, length);
++
++  if (c->orphaned) {
++    unlink_request(h, c);
++    free(c);
++  }
+ }
+ 
+-/* Reading and writing are the same except for the endpoint */
+-int usb_submit_async(void *context, char *bytes, int size)
++/*
++ * Reap every URB that has finished on the device and file each with its
++ * request. Never blocks.
++ */
++static void drain_locked(struct linux_handle *h)
+ {
+-	int ret;
++  int filed = 0;
++
++  if (h->closing)
++    return;
+ 
+-	usb_context_t *c = (usb_context_t *)context;
++  for (;;) {
++    struct usb_urb *urb = NULL;
++    struct usb_async *c;
+ 
+-	c->urb.buffer = bytes;
+-	c->urb.buffer_length = size;
+-	c->urb.usercontext = c;
+-	c->reaped = 0;
++    if (ioctl(h->fd, IOCTL_USB_REAPURBNDELAY, &urb) < 0) {
++      if (errno == ENODEV)
++        h->gone = 1;		/* unplugged, and nothing left to reap */
++      break;
++    }
++    for (c = h->requests; c && &c->urb != urb; c = c->next)
++      ;
++    if (!c) {
++      TRACE(1, "reaped a URB that no request owns");
++      continue;
++    }
++    complete_locked(h, c);
++    filed = 1;
++  }
+ 
+-	ret = ioctl(c->dev->fd, IOCTL_USB_SUBMITURB, &c->urb);
+-	if (ret < 0) {
+-		USB_ERROR_STR(-errno, "error submitting URB: %s", strerror(errno));
+-		return ret;
+-	}
++  if (filed)
++    wake_locked(h);
++}
+ 
+-	return 0;
++/* Have the kernel stop c; it lands among the finished URBs right away. */
++static void discard_locked(struct linux_handle *h, struct usb_async *c)
++{
++  /* EINVAL: it had already finished, ENODEV: the device is gone */
++  if (ioctl(h->fd, IOCTL_USB_DISCARDURB, &c->urb) < 0 &&
++      errno != EINVAL && errno != ENODEV)
++    TRACE(1, "ep 0x%02x: could not discard a request: %s", c->ep,
++          strerror(errno));
+ }
+ 
+-static int _usb_reap_async(void *context, int timeout, int cancel)
++/* Stop every request pending on the endpoint, and collect them. */
++static void abort_endpoint_locked(struct linux_handle *h, unsigned char ep)
+ {
+-	int rc;
+-	usb_context_t *c = (usb_context_t *)context;
+-	struct usb_urb *urb;
++  struct usb_async *c;
++
++  for (c = h->requests; c; c = c->next)
++    if (c->state == ASYNC_PENDING && c->ep == ep)
++      discard_locked(h, c);
++  drain_locked(h);
++}
+ 
+-	if (c->reaped)
+-		return c->urb.actual_length;
++/*
++ * Sleep on the condition variable until woken or the deadline passes
++ * (NULL: no deadline), and for at most nap_ms if that is above 0.
++ */
++static void sleep_locked(struct linux_handle *h,
++	const struct timespec *deadline, int nap_ms)
++{
++  struct timespec nap;
+ 
+-again:
+-	rc = ioctl(c->dev->fd, IOCTL_USB_REAPURB, &urb);
+-	if (rc < 0) {
+-		fprintf(stderr, "error reaping URB: %s", strerror(errno));
+-		return rc;
+-	}
++  if (nap_ms > 0) {
++    deadline_in(&nap, nap_ms);
++    if (!deadline || deadline->tv_sec > nap.tv_sec ||
++        (deadline->tv_sec == nap.tv_sec && deadline->tv_nsec > nap.tv_nsec))
++      deadline = &nap;
++  }
++  if (deadline)
++    pthread_cond_timedwait(&h->cond, &h->lock, deadline);
++  else
++    pthread_cond_wait(&h->cond, &h->lock);
++}
+ 
+-	usb_context_t *b = (usb_context_t *)urb->usercontext;
+-	if (b != c) {
+-		b->reaped = 1;
+-		goto again;
+-	}
++/*
++ * Sleep in poll() until a URB finishes, wake_locked() is called or ms
++ * milliseconds pass (-1: no limit), with the lock dropped meanwhile.
++ */
++static void poll_locked(struct linux_handle *h, int ms)
++{
++  struct pollfd fds[2];
++  uint64_t count;
++  int n;
++
++  h->polling = 1;
++  pthread_mutex_unlock(&h->lock);
++
++  fds[0].fd = h->fd;		/* usbfs: writable = a finished URB to reap */
++  fds[0].events = POLLOUT;
++  fds[0].revents = 0;
++  fds[1].fd = h->wake_fd;
++  fds[1].events = POLLIN;
++  fds[1].revents = 0;
++  n = poll(fds, 2, ms);
++  if (n > 0 && (fds[1].revents & POLLIN) &&
++      read(h->wake_fd, &count, sizeof(count)) < 0) {
++    /* nothing to clear */
++  }
+ 
+-#if 0
+-	/* Not ready for usb_cancel_async */
+-	if (cancel) {
+-		usb_cancel_async(context);
+-	}
+-#else
+-	(void)cancel;
+-#endif
+-	return urb->actual_length;
++  pthread_mutex_lock(&h->lock);
++  h->polling = 0;
++  /* usbfs: hung up = unplugged, and poll() no longer waits */
++  if (n > 0 && (fds[0].revents & (POLLHUP | POLLERR | POLLNVAL)))
++    h->gone = 1;
++  pthread_cond_broadcast(&h->cond);	/* another waiter may take over */
+ }
+ 
+-int usb_reap_async(void *context, int timeout)
++/*
++ * Wait until c has finished, the deadline has passed (NULL: no deadline)
++ * or the device is being closed. Returns nonzero if c finished. Called,
++ * and returns, with the lock held.
++ *
++ * One waiting thread at a time sleeps in poll() on the device. When it
++ * wakes it files every finished URB with its request; the others sleep on
++ * the condition variable, and one of them takes over poll() when it
++ * leaves. A thread that files someone else's result, or closes the device,
++ * wakes the one in poll() through the eventfd. Nobody sleeps holding the
++ * lock, and no completion can go to the wrong thread.
++ */
++static int wait_for(struct linux_handle *h, struct usb_async *c,
++	const struct timespec *deadline)
+ {
+-	return _usb_reap_async(context, timeout, 1);
++  h->waiters++;
++
++  for (;;) {
++    int ms;
++
++    drain_locked(h);
++    if (c->state == ASYNC_DONE || h->closing)
++      break;
++    ms = deadline ? ms_left(deadline) : -1;
++    if (ms == 0)
++      break;
++
++    if (c->state == ASYNC_IDLE)
++      /* never submitted, so nothing will finish it: a Windows wait on its
++         event just runs out the clock, and so does this one */
++      sleep_locked(h, deadline, 0);
++    else if (h->gone)
++      /* unplugged: the kernel gives everything back within milliseconds,
++         but poll() no longer waits, so nap instead */
++      sleep_locked(h, deadline, 10);
++    else if (h->polling)
++      /* look for itself now and then, in case the thread in poll() is
++         held up (suspended, or killed with TerminateThread) */
++      sleep_locked(h, deadline, 250);
++    else
++      poll_locked(h, ms);
++  }
++
++  h->waiters--;
++  if (h->closing)
++    pthread_cond_broadcast(&h->cond);	/* async_close() waits for this */
++  return c->state == ASYNC_DONE;
+ }
+ 
+-int usb_reap_async_nocancel(void *context, int timeout)
++static int async_open(usb_dev_handle *dev)
+ {
+-	return _usb_reap_async(context, timeout, 0);
++  struct linux_handle *h;
++  pthread_condattr_t attr;
++  int err;
++
++  h = calloc(1, sizeof(*h));
++  if (!h)
++    USB_ERROR(-ENOMEM);
++  h->wake_fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
++  if (h->wake_fd < 0) {
++    err = errno;
++    free(h);
++    USB_ERROR_STR(win_error(err), "could not open %s/%s: eventfd: %s",
++      dev->bus->dirname, dev->device->filename, strerror(err));
++  }
++  h->fd = dev->fd;
++  pthread_mutex_init(&h->lock, NULL);
++  pthread_condattr_init(&attr);
++  pthread_condattr_setclock(&attr, CLOCK_MONOTONIC);
++  pthread_cond_init(&h->cond, &attr);
++  pthread_condattr_destroy(&attr);
++
++  dev->impl_info = h;
++  return 0;
+ }
+ 
++/*
++ * End whatever is still pending, the way closing the file handle does on
++ * Windows: as aborted. Threads waiting in usb_reap_async() return. The
++ * program still owns its contexts and has to free them, but they no
++ * longer refer to the device.
++ *
++ * Returns -1 if a waiting thread did not leave within two seconds (it is
++ * suspended, say). Its lock, its eventfd and the device's file stay open
++ * for it then, rather than being pulled out from under it.
++ */
++static int async_close(usb_dev_handle *dev)
++{
++  struct linux_handle *h = handle_of(dev);
++  struct usb_async *c, *next;
++  struct timespec deadline;
++  int stuck;
++
++  if (!h)
++    return 0;
++  dev->impl_info = NULL;
++
++  pthread_mutex_lock(&h->lock);
++  for (c = h->requests; c; c = c->next)
++    if (c->state == ASYNC_PENDING)
++      discard_locked(h, c);
++  drain_locked(h);
++  h->closing = 1;
++
++  for (c = h->requests; c; c = next) {
++    next = c->next;
++    c->next = NULL;
++    if (c->orphaned) {
++      /* nobody reaps from now on, so the kernel never writes to it again */
++      free(c);
++      continue;
++    }
++    if (c->state == ASYNC_PENDING)
++      finish(c, -ETRANSFER_TIMEDOUT, USBWINE_ERROR_OPERATION_ABORTED);
++    c->dev = NULL;
++  }
++  h->requests = NULL;
++  wake_locked(h);
++
++  deadline_in(&deadline, 2000);
++  while (h->waiters > 0 &&
++         pthread_cond_timedwait(&h->cond, &h->lock, &deadline) != ETIMEDOUT)
++    ;
++  stuck = h->waiters > 0;
++  pthread_mutex_unlock(&h->lock);
++
++  if (stuck) {
++    TRACE(1, "%s/%s: closed with a thread still waiting; its state is kept for it",
++          dev->bus->dirname, dev->device->filename);
++    return -1;
++  }
++
++  pthread_cond_destroy(&h->cond);
++  pthread_mutex_destroy(&h->lock);
++  close(h->wake_fd);
++  free(h);
++  return 0;
++}
+ 
+-int usb_cancel_async(void *context)
++/*
++ * libusb-win32 handles interrupt endpoints just like bulk ones. So does
++ * this: the kernel turns a bulk URB on an interrupt endpoint into an
++ * interrupt transfer, whereas it refuses an interrupt URB on a bulk one.
++ */
++static int setup_async(usb_dev_handle *dev, void **context, unsigned char ep,
++	const char *what)
+ {
+-	printf("%s()\n", __func__);
+-	USB_ERROR_STR(-errno, "usb_cancel_async is not yet implemented: %s\n", strerror(errno));
+-#if 0
+-    /* NOTE that this function will cancel all pending URBs */
+-    /* on the same endpoint as this particular context, or even */
+-    /* all pending URBs for this particular device. */
++  struct linux_handle *h = handle_of(dev);
++  struct usb_async *c;
++
++  if (!context)
++    USB_ERROR_STR(-EINVAL, "%s: invalid context", what);
++  *context = NULL;
++  if (!h)
++    USB_ERROR_STR(-EINVAL, "%s: invalid device handle", what);
++
++  c = calloc(1, sizeof(*c));
++  if (!c)
++    USB_ERROR_STR(-ENOMEM, "%s: out of memory", what);
++  c->dev = dev;
++  c->ep = ep;
++
++  pthread_mutex_lock(&h->lock);
++  c->next = h->requests;
++  h->requests = c;
++  pthread_mutex_unlock(&h->lock);
++
++  *context = c;
++  return 0;
++}
+ 
+-    usb_context_t *c = (usb_context_t *)context;
++LIBUSB_API int usb_bulk_setup_async(usb_dev_handle *dev, void **context,
++	unsigned char ep)
++{
++  return setup_async(dev, context, ep, "usb_bulk_setup_async");
++}
+ 
+-    if (!c)
+-    {
+-        USBERR0("invalid context\n");
+-        return -EINVAL;
+-    }
++LIBUSB_API int usb_interrupt_setup_async(usb_dev_handle *dev, void **context,
++	unsigned char ep)
++{
++  return setup_async(dev, context, ep, "usb_interrupt_setup_async");
++}
+ 
+-    if (c->dev->impl_info == INVALID_HANDLE_VALUE)
+-    {
+-        USBERR0("device not open\n");
+-        return -EINVAL;
+-    }
++LIBUSB_API int usb_submit_async(void *context, char *bytes, int size)
++{
++  struct usb_async *c = context;
++  struct linux_handle *h;
++  usb_dev_handle *dev;
++  int err;
++
++  if (!c)
++    USB_ERROR_STR(-EINVAL, "usb_submit_async: invalid context");
++  dev = c->dev;
++  h = handle_of(dev);
++  if (!h)
++    USB_ERROR_STR(-EINVAL, "usb_submit_async: device not open");
++
++  /* the checks libusb-win32 makes */
++  if (dev->config <= 0)
++    USB_ERROR_STR(-EINVAL, "usb_submit_async: invalid configuration %d",
++      dev->config);
++  if (dev->interface < 0)
++    USB_ERROR_STR(-EINVAL, "usb_submit_async: invalid interface %d",
++      dev->interface);
+ 
+-    _usb_cancel_io(c);
++  pthread_mutex_lock(&h->lock);
++  if (c->state == ASYNC_PENDING) {
++    pthread_mutex_unlock(&h->lock);
++    USB_ERROR_STR(-EINVAL, "usb_submit_async: a request is already pending");
++  }
+ 
+-    return 0;
+-#endif
+-	int rc;
+-	usb_context_t *c = (usb_context_t *)context;
++  /* like ResetEvent(): until this one finishes, reaps wait */
++  c->state = ASYNC_IDLE;
++  memset(&c->urb, 0, sizeof(c->urb));
++  c->urb.type = USB_URB_TYPE_BULK;	/* see setup_async() */
++  c->urb.endpoint = c->ep;
++  c->urb.buffer = bytes;
++  c->urb.buffer_length = size;
++
++  if (ioctl(h->fd, IOCTL_USB_SUBMITURB, &c->urb) < 0) {
++    err = errno;
++    if (err == ENODEV)
++      h->gone = 1;
++    pthread_mutex_unlock(&h->lock);
++    USB_ERROR_STR(win_error(err), "usb_submit_async: ep 0x%02x: %s", c->ep,
++      strerror(err));
++  }
++  c->state = ASYNC_PENDING;
++  pthread_mutex_unlock(&h->lock);
+ 
+-	rc = ioctl(c->dev->fd, IOCTL_USB_DISCARDURB, &c->urb);
+-	if (rc < 0)
+-		fprintf(stderr, "error discarding URB: %s", strerror(errno));
++  TRACE(4, "ep 0x%02x: request submitted, %d bytes", c->ep, size);
++  return 0;
++}
+ 
+-	/*
+-	* When the URB is unlinked, it gets moved to the completed list and
+-	* then we need to reap it or else the next time we call this function,
+-	* we'll get the previous completion and exit early
+-	*/
+-	ioctl(c->dev->fd, IOCTL_USB_REAPURB, &context);
++static int reap(void *context, int timeout, int cancel, const char *what)
++{
++  struct usb_async *c = context;
++  struct linux_handle *h;
++  struct timespec deadline;
++  unsigned int last_error;
++  int result, finished;
++
++  if (!c)
++    USB_ERROR_STR(-EINVAL, "%s: invalid context", what);
++
++  h = handle_of(c->dev);
++  if (h) {
++    if (timeout >= 0)
++      deadline_in(&deadline, timeout);
++
++    pthread_mutex_lock(&h->lock);
++    finished = wait_for(h, c, timeout >= 0 ? &deadline : NULL);
++    if (!finished && cancel && !h->closing && c->state == ASYNC_PENDING) {
++      abort_endpoint_locked(h, c->ep);
++      /* it may have finished, with data, just before the abort */
++      finished = c->state == ASYNC_DONE && c->result >= 0;
++    }
++    if (finished) {
++      result = c->result;
++      last_error = c->last_error;
++    } else {
++      result = -ETRANSFER_TIMEDOUT;
++      last_error = h->closing ? USBWINE_ERROR_OPERATION_ABORTED
++                              : USBWINE_ERROR_SEM_TIMEOUT;
++    }
++    pthread_mutex_unlock(&h->lock);
++  } else if (c->state == ASYNC_DONE) {
++    /* the device is closed; what finished before is still reported */
++    result = c->result;
++    last_error = c->last_error;
++  } else
++    USB_ERROR_STR(-EINVAL, "%s: device not open", what);
++
++  if (result < 0) {
++    usbwine_set_last_error(last_error);
++    USB_ERROR_SET("%s: ep 0x%02x: %s", what, c->ep,
++      last_error == USBWINE_ERROR_SEM_TIMEOUT ? "timeout" :
++      last_error == USBWINE_ERROR_OPERATION_ABORTED ? "request aborted" :
++      "request failed");
++  }
++  return result;
++}
+ 
+-	return 0;
++LIBUSB_API int usb_reap_async(void *context, int timeout)
++{
++  return reap(context, timeout, 1, "usb_reap_async");
+ }
+ 
+-int usb_free_async(void **context)
++LIBUSB_API int usb_reap_async_nocancel(void *context, int timeout)
+ {
+-	usb_context_t **c = (usb_context_t **)context;
++  return reap(context, timeout, 0, "usb_reap_async_nocancel");
++}
+ 
+-	if (!*c) {
+-		USB_ERROR_STR(-errno, "invalid context: %s\n", strerror(errno));
+-		return -EINVAL;
+-	}
++LIBUSB_API int usb_cancel_async(void *context)
++{
++  struct usb_async *c = context;
++  struct linux_handle *h;
++
++  if (!c)
++    USB_ERROR_STR(-EINVAL, "usb_cancel_async: invalid context");
++  h = handle_of(c->dev);
++  if (!h)
++    USB_ERROR_STR(-EINVAL, "usb_cancel_async: device not open");
++
++  pthread_mutex_lock(&h->lock);
++  abort_endpoint_locked(h, c->ep);
++  pthread_mutex_unlock(&h->lock);
++  return 0;
++}
+ 
+-	free(*c);
+-	*c = NULL;
++LIBUSB_API int usb_free_async(void **context)
++{
++  struct usb_async *c;
++  struct linux_handle *h;
++
++  if (!context || !*context)
++    USB_ERROR_STR(-EINVAL, "usb_free_async: invalid context");
++  c = *context;
++  *context = NULL;
++
++  h = handle_of(c->dev);
++  if (h) {
++    pthread_mutex_lock(&h->lock);
++    if (c->state == ASYNC_PENDING) {
++      /* libusb-win32 frees it with the request still running, and the
++         driver writes to the freed memory later. Stop it first. */
++      discard_locked(h, c);
++      drain_locked(h);
++    }
++    if (c->state == ASYNC_PENDING) {
++      /* the kernel still has it (the device is going away): free it when
++         it comes back, or when the device is closed */
++      c->orphaned = 1;
++      pthread_mutex_unlock(&h->lock);
++      return 0;
++    }
++    unlink_request(h, c);
++    pthread_mutex_unlock(&h->lock);
++  }
+ 
+-	return 0;
++  free(c);
++  return 0;
+ }
+diff --git a/src/linux.h b/src/linux.h
+index 8f20ef3..1051845 100644
+--- a/src/linux.h
++++ b/src/linux.h
+@@ -90,6 +90,16 @@ struct usb_hub_portinfo {
+ 	unsigned char port[127];	/* port to device num mapping */
+ };
+ 
++struct usb_disconnect_claim {
++	/* keep in sync with usbdevice_fs.h:usbdevfs_disconnect_claim */
++	unsigned int interface;
++	unsigned int flags;
++	char driver[USB_MAXDRIVERNAME + 1];
++};
++
++#define USB_DISCONNECT_CLAIM_IF_DRIVER		0x01
++#define USB_DISCONNECT_CLAIM_EXCEPT_DRIVER	0x02
++
+ #define IOCTL_USB_CONTROL	_IOWR('U', 0, struct usb_ctrltransfer)
+ #define IOCTL_USB_BULK		_IOWR('U', 2, struct usb_bulktransfer)
+ #define IOCTL_USB_RESETEP	_IOR('U', 3, unsigned int)
+@@ -109,6 +119,7 @@ struct usb_hub_portinfo {
+ #define IOCTL_USB_CLEAR_HALT	_IOR('U', 21, unsigned int)
+ #define IOCTL_USB_DISCONNECT	_IO('U', 22)
+ #define IOCTL_USB_CONNECT	_IO('U', 23)
++#define IOCTL_USB_DISCONNECT_CLAIM	_IOR('U', 27, struct usb_disconnect_claim)
+ 
+ /*
+  * IOCTL_USB_HUB_PORTINFO, IOCTL_USB_DISCONNECT and IOCTL_USB_CONNECT
+diff --git a/src/lsusb-wine.c b/src/lsusb-wine.c
+index 69c2722..c234d7f 100644
+--- a/src/lsusb-wine.c
++++ b/src/lsusb-wine.c
+@@ -1,7 +1,8 @@
+ /*
+- * Test utility for libusb-wine.
+- * compile with winegcc -o lsusb-wine lsusb-wine.c -lusb0
+- * run as ./lsusb-wine.exe, it should list VID/PIDs of connected USB devices
++ * Test utility for libusb-wine: lists the VID:PID of each device it sees.
++ * After make -f Makefile.x64 install install-dev (see README.md):
++ *   winegcc -o lsusb-wine lsusb-wine.c -lusb0
++ *   wine lsusb-wine.exe.so
+  */
+ 
+ #include <stdio.h>
+diff --git a/src/usb-wine.c b/src/usb-wine.c
+index 3acd7ea..fd3f111 100644
+--- a/src/usb-wine.c
++++ b/src/usb-wine.c
+@@ -3,7 +3,9 @@
+  * Stanson <me@stanson.ch>
+  */
+ 
++#include <stdarg.h>
+ #include <windef.h>
++#include <winbase.h>
+ #include "usb-wine.h"
+ 
+ static struct usb_version _usb_version = {
+@@ -14,11 +16,16 @@ static struct usb_version _usb_version = {
+   { -1, -1, -1, -1 }
+ };
+ 
+-const struct usb_version *usb_get_version(void)
++LIBUSB_API const struct usb_version *usb_get_version(void)
+ {
+   return &_usb_version;
+ }
+ 
++void usbwine_set_last_error(unsigned int code)
++{
++  SetLastError(code);
++}
++
+ /* DLL main entry point */
+ BOOL WINAPI DllMain(HINSTANCE module, DWORD reason, LPVOID reserved)
+ {
+diff --git a/src/usb-wine.h b/src/usb-wine.h
+index 0055c03..f819c2f 100644
+--- a/src/usb-wine.h
++++ b/src/usb-wine.h
+@@ -6,6 +6,8 @@
+ #ifndef __USB_WINE_H__
+ #define __USB_WINE_H__
+ 
++#include "usb.h"
++
+ #define VERSION_MAJOR 0
+ #define VERSION_MINOR 1
+ #define VERSION_MICRO 12
+@@ -27,4 +29,19 @@ struct usb_version {
+   } driver;
+ };
+ 
++LIBUSB_API const struct usb_version *usb_get_version(void);
++
++/*
++ * Win32 error codes that libusb-win32 leaves for GetLastError() after a
++ * failed reap. Programs look at them: ANT_DLL takes a timed-out reap whose
++ * last error is ERROR_OPERATION_ABORTED to mean the stick lost power.
++ */
++#define USBWINE_ERROR_GEN_FAILURE		31
++#define USBWINE_ERROR_SEM_TIMEOUT		121
++#define USBWINE_ERROR_OPERATION_ABORTED		995
++
++/* SetLastError() for the calling thread. It lives in usb-wine.c, so that
++   the rest of the library needs no Windows headers. */
++void usbwine_set_last_error(unsigned int code);
++
+ #endif /* __USB_WINE_H__ */
+diff --git a/src/usb.c b/src/usb.c
+index 9b8773e..567a73c 100644
+--- a/src/usb.c
++++ b/src/usb.c
+@@ -16,7 +16,7 @@
+ int usb_debug = 0;
+ struct usb_bus *usb_busses = NULL;
+ 
+-int usb_find_busses(void)
++LIBUSB_API int usb_find_busses(void)
+ {
+   struct usb_bus *busses, *bus;
+   int ret, changes = 0;
+@@ -86,7 +86,7 @@ int usb_find_busses(void)
+   return changes;
+ }
+ 
+-int usb_find_devices(void)
++LIBUSB_API int usb_find_devices(void)
+ {
+   struct usb_bus *bus;
+   int ret, changes = 0;
+@@ -178,7 +178,7 @@ int usb_find_devices(void)
+   return changes;
+ }
+ 
+-void usb_set_debug(int level)
++LIBUSB_API void usb_set_debug(int level)
+ {
+   if (usb_debug || level)
+     fprintf(stderr, "usb_set_debug: Setting debugging level to %d (%s)\n",
+@@ -187,7 +187,7 @@ void usb_set_debug(int level)
+   usb_debug = level;
+ }
+ 
+-void usb_init(void)
++LIBUSB_API void usb_init(void)
+ {
+   if (getenv("USB_DEBUG"))
+     usb_set_debug(atoi(getenv("USB_DEBUG")));
+@@ -195,10 +195,15 @@ void usb_init(void)
+   usb_os_init();
+ }
+ 
+-usb_dev_handle *usb_open(struct usb_device *dev)
++LIBUSB_API usb_dev_handle *usb_open(struct usb_device *dev)
+ {
+   usb_dev_handle *udev;
+ 
++  if (!dev || !dev->bus) {
++    USB_ERROR_SET("usb_open: invalid device");
++    return NULL;
++  }
++
+   udev = malloc(sizeof(*udev));
+   if (!udev)
+     return NULL;
+@@ -207,6 +212,7 @@ usb_dev_handle *usb_open(struct usb_device *dev)
+   udev->device = dev;
+   udev->bus = dev->bus;
+   udev->config = udev->interface = udev->altsetting = -1;
++  udev->impl_info = NULL;
+ 
+   if (usb_os_open(udev) < 0) {
+     free(udev);
+@@ -216,8 +222,8 @@ usb_dev_handle *usb_open(struct usb_device *dev)
+   return udev;
+ }
+ 
+-int usb_get_string(usb_dev_handle *dev, int index, int langid, char *buf,
+-	size_t buflen)
++LIBUSB_API int usb_get_string(usb_dev_handle *dev, int index, int langid,
++	char *buf, size_t buflen)
+ {
+   /*
+    * We can't use usb_get_descriptor() because it's lacking the index
+@@ -227,11 +233,15 @@ int usb_get_string(usb_dev_handle *dev, int index, int langid, char *buf,
+ 			(USB_DT_STRING << 8) + index, langid, buf, buflen, 1000);
+ }
+ 
+-int usb_get_string_simple(usb_dev_handle *dev, int index, char *buf, size_t buflen)
++LIBUSB_API int usb_get_string_simple(usb_dev_handle *dev, int index, char *buf,
++	size_t buflen)
+ {
+-  char tbuf[255];	/* Some devices choke on size > 255 */
++  unsigned char tbuf[255];	/* Some devices choke on size > 255 */
+   int ret, langid, si, di;
+ 
++  if (!buf || !buflen)
++    USB_ERROR_STR(-EINVAL, "usb_get_string_simple: invalid buffer");
++
+   /*
+    * Asking for the zero'th index is special - it returns a string
+    * descriptor that contains all the language IDs supported by the
+@@ -239,7 +249,7 @@ int usb_get_string_simple(usb_dev_handle *dev, int index, char *buf, size_t bufl
+    * language IDs are 16 bit numbers, and they start at the third byte
+    * in the descriptor. See USB 2.0 specification, section 9.6.7, for
+    * more information on this. */
+-  ret = usb_get_string(dev, 0, 0, tbuf, sizeof(tbuf));
++  ret = usb_get_string(dev, 0, 0, (char *)tbuf, sizeof(tbuf));
+   if (ret < 0)
+     return ret;
+ 
+@@ -248,18 +258,20 @@ int usb_get_string_simple(usb_dev_handle *dev, int index, char *buf, size_t bufl
+ 
+   langid = tbuf[2] | (tbuf[3] << 8);
+ 
+-  ret = usb_get_string(dev, index, langid, tbuf, sizeof(tbuf));
++  ret = usb_get_string(dev, index, langid, (char *)tbuf, sizeof(tbuf));
+   if (ret < 0)
+     return ret;
+ 
+-  if (tbuf[1] != USB_DT_STRING)
++  if (ret < 2 || tbuf[1] != USB_DT_STRING)
+     return -EIO;
+ 
+   if (tbuf[0] > ret)
+     return -EFBIG;
+ 
+-  for (di = 0, si = 2; si < tbuf[0]; si += 2) {
+-    if (di >= (buflen - 1))
++  /* stop at the last whole UTF-16 code unit: bLength may be odd, and as
++     large as tbuf */
++  for (di = 0, si = 2; si + 1 < tbuf[0]; si += 2) {
++    if (di >= (int)(buflen - 1))
+       break;
+ 
+     if (tbuf[si + 1])	/* high byte */
+@@ -273,19 +285,22 @@ int usb_get_string_simple(usb_dev_handle *dev, int index, char *buf, size_t bufl
+   return di;
+ }
+ 
+-int usb_close(usb_dev_handle *dev)
++LIBUSB_API int usb_close(usb_dev_handle *dev)
+ {
+   int ret;
+ 
++  if (!dev)
++    USB_ERROR_STR(-EINVAL, "usb_close: invalid device handle");
++
+   ret = usb_os_close(dev);
+   free(dev);
+ 
+   return ret;
+ }
+ 
+-struct usb_device *usb_device(usb_dev_handle *dev)
++LIBUSB_API struct usb_device *usb_device(usb_dev_handle *dev)
+ {
+-  return dev->device;
++  return dev ? dev->device : NULL;
+ }
+ 
+ void usb_free_dev(struct usb_device *dev)
+@@ -295,7 +310,7 @@ void usb_free_dev(struct usb_device *dev)
+   free(dev);
+ }
+ 
+-struct usb_bus *usb_get_busses(void)
++LIBUSB_API struct usb_bus *usb_get_busses(void)
+ {
+   return usb_busses;
+ }
+diff --git a/src/usb.h b/src/usb.h
+index f60ef21..d8debc4 100644
+--- a/src/usb.h
++++ b/src/usb.h
+@@ -27,6 +27,25 @@
+ 
+ #define LIBUSB_PATH_MAX 512
+ 
++/*
++ * Calling convention of the API.
++ *
++ * Windows programs call these functions with the Microsoft x64 convention:
++ * arguments in rcx, rdx, r8 and r9, and rsi and rdi preserved. This library
++ * is built by the Linux compiler, whose x86-64 default is the System V
++ * convention (arguments in rdi, rsi, ...), and winebuild puts nothing in
++ * between. So every exported function has to say which convention it uses.
++ * gcc makes the attribute part of the function's type: a definition that
++ * leaves it out conflicts with its prototype here and does not compile.
++ *
++ * On 32-bit x86 the program and the library both use cdecl.
++ */
++#ifdef __x86_64__
++#define LIBUSB_API __attribute__((ms_abi))
++#else
++#define LIBUSB_API
++#endif
++
+ 
+ /*
+  * Device and/or Interface Class codes
+@@ -290,63 +309,66 @@ extern "C" {
+ /* Function prototypes */
+ 
+ /* usb.c */
+-usb_dev_handle *usb_open(struct usb_device *dev);
+-int usb_close(usb_dev_handle *dev);
+-int usb_get_string(usb_dev_handle *dev, int index, int langid, char *buf,
+-	size_t buflen);
+-int usb_get_string_simple(usb_dev_handle *dev, int index, char *buf,
+-	size_t buflen);
++LIBUSB_API usb_dev_handle *usb_open(struct usb_device *dev);
++LIBUSB_API int usb_close(usb_dev_handle *dev);
++LIBUSB_API int usb_get_string(usb_dev_handle *dev, int index, int langid,
++	char *buf, size_t buflen);
++LIBUSB_API int usb_get_string_simple(usb_dev_handle *dev, int index,
++	char *buf, size_t buflen);
+ 
+ /* descriptors.c */
+-int usb_get_descriptor_by_endpoint(usb_dev_handle *udev, int ep,
++LIBUSB_API int usb_get_descriptor_by_endpoint(usb_dev_handle *udev, int ep,
+ 	unsigned char type, unsigned char index, void *buf, int size);
+-int usb_get_descriptor(usb_dev_handle *udev, unsigned char type,
++LIBUSB_API int usb_get_descriptor(usb_dev_handle *udev, unsigned char type,
+ 	unsigned char index, void *buf, int size);
+ 
+ /* <arch>.c */
+-int usb_bulk_write(usb_dev_handle *dev, int ep, char *bytes, int size,
+-	int timeout);
+-int usb_bulk_read(usb_dev_handle *dev, int ep, char *bytes, int size,
+-	int timeout);
+-int usb_interrupt_write(usb_dev_handle *dev, int ep, char *bytes, int size,
+-        int timeout);
+-int usb_interrupt_read(usb_dev_handle *dev, int ep, char *bytes, int size,
+-        int timeout);
+-int usb_control_msg(usb_dev_handle *dev, int requesttype, int request,
+-	int value, int index, char *bytes, int size, int timeout);
+-int usb_set_configuration(usb_dev_handle *dev, int configuration);
+-int usb_claim_interface(usb_dev_handle *dev, int interface);
+-int usb_release_interface(usb_dev_handle *dev, int interface);
+-int usb_set_altinterface(usb_dev_handle *dev, int alternate);
+-int usb_resetep(usb_dev_handle *dev, unsigned int ep);
+-int usb_clear_halt(usb_dev_handle *dev, unsigned int ep);
+-int usb_reset(usb_dev_handle *dev);
++LIBUSB_API int usb_bulk_write(usb_dev_handle *dev, int ep, char *bytes,
++	int size, int timeout);
++LIBUSB_API int usb_bulk_read(usb_dev_handle *dev, int ep, char *bytes,
++	int size, int timeout);
++LIBUSB_API int usb_interrupt_write(usb_dev_handle *dev, int ep, char *bytes,
++	int size, int timeout);
++LIBUSB_API int usb_interrupt_read(usb_dev_handle *dev, int ep, char *bytes,
++	int size, int timeout);
++LIBUSB_API int usb_control_msg(usb_dev_handle *dev, int requesttype,
++	int request, int value, int index, char *bytes, int size, int timeout);
++LIBUSB_API int usb_set_configuration(usb_dev_handle *dev, int configuration);
++LIBUSB_API int usb_claim_interface(usb_dev_handle *dev, int interface);
++LIBUSB_API int usb_release_interface(usb_dev_handle *dev, int interface);
++LIBUSB_API int usb_set_altinterface(usb_dev_handle *dev, int alternate);
++LIBUSB_API int usb_resetep(usb_dev_handle *dev, unsigned int ep);
++LIBUSB_API int usb_clear_halt(usb_dev_handle *dev, unsigned int ep);
++LIBUSB_API int usb_reset(usb_dev_handle *dev);
+ 
+ #if 1
+ #define LIBUSB_HAS_GET_DRIVER_NP 1
+-int usb_get_driver_np(usb_dev_handle *dev, int interface, char *name,
+-	unsigned int namelen);
++LIBUSB_API int usb_get_driver_np(usb_dev_handle *dev, int interface,
++	char *name, unsigned int namelen);
+ #define LIBUSB_HAS_DETACH_KERNEL_DRIVER_NP 1
+-int usb_detach_kernel_driver_np(usb_dev_handle *dev, int interface);
++LIBUSB_API int usb_detach_kernel_driver_np(usb_dev_handle *dev, int interface);
+ #endif
+ 
+-const char *usb_strerror(void);
++LIBUSB_API const char *usb_strerror(void);
+ 
+-void usb_init(void);
+-void usb_set_debug(int level);
+-int usb_find_busses(void);
+-int usb_find_devices(void);
+-struct usb_device *usb_device(usb_dev_handle *dev);
+-struct usb_bus *usb_get_busses(void);
++LIBUSB_API void usb_init(void);
++LIBUSB_API void usb_set_debug(int level);
++LIBUSB_API int usb_find_busses(void);
++LIBUSB_API int usb_find_devices(void);
++LIBUSB_API struct usb_device *usb_device(usb_dev_handle *dev);
++LIBUSB_API struct usb_bus *usb_get_busses(void);
+ 
+ 
+-int usb_bulk_setup_async(usb_dev_handle *dev, void **context,
+-                     unsigned char ep);
++LIBUSB_API int usb_bulk_setup_async(usb_dev_handle *dev, void **context,
++	unsigned char ep);
++LIBUSB_API int usb_interrupt_setup_async(usb_dev_handle *dev, void **context,
++	unsigned char ep);
+ 
+-int usb_submit_async(void *context, char *bytes, int size);
+-int usb_reap_async(void *context, int timeout);
+-int usb_free_async(void **context);
+-int usb_cancel_async (void *context);
++LIBUSB_API int usb_submit_async(void *context, char *bytes, int size);
++LIBUSB_API int usb_reap_async(void *context, int timeout);
++LIBUSB_API int usb_reap_async_nocancel(void *context, int timeout);
++LIBUSB_API int usb_free_async(void **context);
++LIBUSB_API int usb_cancel_async(void *context);
+ 
+ #ifdef __cplusplus
+ }
+diff --git a/tests/libusb0-test.c b/tests/libusb0-test.c
+new file mode 100644
+index 0000000..94cfe8a
+--- /dev/null
++++ b/tests/libusb0-test.c
+@@ -0,0 +1,756 @@
++/*
++ * libusb0-test.exe: libusb0.dll as a Windows program sees it.
++ *
++ * An ordinary Windows program, built with mingw and linked to libusb0.dll
++ * through an import library. run.sh builds it and runs it under Wine with
++ * the usbfs emulator (usbemu.c) preloaded. Each argument names a test:
++ *
++ *   abi       exports and the Microsoft x64 calling convention
++ *   list      which devices are listed, and libusb-win32's virtual hub
++ *   list-all  the same with LIBUSB0_ALL_DEVICES=1: every device, real tree
++ *   claim     configurations, interfaces, taking a kernel driver's device
++ *   keep      with LIBUSB0_DETACH_KERNEL_DRIVER=0: the driver keeps it
++ *   sync      synchronous transfers
++ *   async     asynchronous transfers: timeouts, cancel, free, last error
++ *   threads   several threads at once, and closing under a waiting one
++ *   unplug    the stick goes away under ANT_DLL's receive loop
++ *   cycles    300 open/use/close cycles, counting file descriptors
++ *   ant       ANT_DLL's own sequence, as Zwift runs it
++ *
++ * The device it talks to is the emulator's ANT USB-m stick: a request
++ * goes out as an ANT message on the bulk OUT endpoint, and the reply comes
++ * back on the bulk IN endpoint a fraction of a millisecond later.
++ */
++
++#include <stdint.h>
++#include <stdio.h>
++#include <string.h>
++#include <windows.h>
++
++/* the Windows headers define interface as struct; libusb-win32's own
++   header undefines it the same way */
++#undef interface
++
++/* usb.h uses the BSD names for its integer types, which mingw lacks */
++typedef uint8_t u_int8_t;
++typedef uint16_t u_int16_t;
++typedef uint32_t u_int32_t;
++#include "usb.h"
++
++#define ETRANSFER_TIMEDOUT  116                 /* libusb-win32's */
++#define ANT_VENDOR          0x0fcf
++#define EP_IN               0x81
++#define EP_OUT              0x01
++
++static int failures;
++
++#define CHECK(cond, ...) \
++    do { \
++        int ok_ = !!(cond); \
++        printf(ok_ ? "  PASS  " : "  FAIL  "); \
++        printf(__VA_ARGS__); \
++        printf("\n"); \
++        failures += !ok_; \
++    } while (0)
++#define INFO(...) do { printf("        "); printf(__VA_ARGS__); printf("\n"); } while (0)
++
++/* GetTickCount() moves in 16 ms steps under Wine */
++static DWORD ms_now(void)
++{
++    static LARGE_INTEGER frequency;
++    LARGE_INTEGER now;
++
++    if (!frequency.QuadPart)
++        QueryPerformanceFrequency(&frequency);
++    QueryPerformanceCounter(&now);
++    return (DWORD)(now.QuadPart * 1000 / frequency.QuadPart);
++}
++
++/* ANT request "send me message 0x54", the stick's capabilities */
++static char caps_request[] = { (char)0xa4, 0x02, 0x4d, 0x00, 0x54, (char)0xbf };
++
++static int is_caps_reply(const char *b, int n)
++{
++    return n >= 3 && (unsigned char)b[0] == 0xa4 && (unsigned char)b[2] == 0x54;
++}
++
++static struct usb_device *find(unsigned short vendor, unsigned short product)
++{
++    struct usb_bus *bus;
++    struct usb_device *dev;
++
++    usb_init();
++    usb_find_busses();
++    usb_find_devices();
++    for (bus = usb_get_busses(); bus; bus = bus->next)
++        for (dev = bus->devices; dev; dev = dev->next)
++            if (dev->descriptor.idVendor == vendor &&
++                (!product || dev->descriptor.idProduct == product))
++                return dev;
++    return NULL;
++}
++
++/* open, configure and claim, the way ANT_DLL does */
++static usb_dev_handle *open_stick(void)
++{
++    struct usb_device *dev = find(ANT_VENDOR, 0);
++    usb_dev_handle *h;
++
++    if (!dev || !(h = usb_open(dev)))
++        return NULL;
++    if (usb_set_configuration(h, 1) || usb_claim_interface(h, 0)) {
++        usb_close(h);
++        return NULL;
++    }
++    return h;
++}
++
++/* ---- abi ------------------------------------------------------------------ */
++
++/*
++ * Call fn with chosen values in both conventions' argument registers:
++ * rcx and rdx for Microsoft x64, which is what a Windows caller uses, and
++ * rdi and rsi for System V, which is what a Linux-compiled function reads.
++ * Whichever pair it acts on shows its convention. Also note whether rdi
++ * and rsi survive: Microsoft x64 makes them callee-saved, System V doesn't.
++ */
++struct probe {
++    void *fn;                                   /*  0 */
++    unsigned long long ms1, ms2;                /*  8, 16 */
++    unsigned long long sv1, sv2;                /* 24, 32 */
++    unsigned long long ret;                     /* 40 */
++    unsigned long long rdi_after, rsi_after;    /* 48, 56 */
++};
++
++static void call_probe(struct probe *p)
++{
++    __asm__ volatile(
++        "mov  %%rsp, %%r12\n\t"
++        "and  $-16, %%rsp\n\t"
++        "sub  $64, %%rsp\n\t"                   /* shadow space, arguments 5..8 */
++        "movq $0, 32(%%rsp)\n\t"
++        "movq $0, 40(%%rsp)\n\t"
++        "movq $0, 48(%%rsp)\n\t"
++        "movq $0, 56(%%rsp)\n\t"
++        "mov  8(%%rbx), %%rcx\n\t"
++        "mov  16(%%rbx), %%rdx\n\t"
++        "xor  %%r8d, %%r8d\n\t"
++        "xor  %%r9d, %%r9d\n\t"
++        "mov  24(%%rbx), %%rdi\n\t"
++        "mov  32(%%rbx), %%rsi\n\t"
++        "call *(%%rbx)\n\t"
++        "mov  %%r12, %%rsp\n\t"
++        "mov  %%rax, 40(%%rbx)\n\t"
++        "mov  %%rdi, 48(%%rbx)\n\t"
++        "mov  %%rsi, 56(%%rbx)\n\t"
++        :
++        : "b"(p)
++        : "rax", "rcx", "rdx", "rsi", "rdi", "r8", "r9", "r10", "r11", "r12",
++          "memory", "cc", "xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5",
++          "xmm6", "xmm7", "xmm8", "xmm9", "xmm10", "xmm11", "xmm12", "xmm13",
++          "xmm14", "xmm15");
++}
++
++static unsigned long long probe(void *fn, unsigned long long ms1, unsigned long long ms2,
++                                unsigned long long sv1, unsigned long long sv2, int *kept)
++{
++    struct probe p = { fn, ms1, ms2, sv1, sv2, 0, 0, 0 };
++
++    call_probe(&p);
++    *kept = p.rdi_after == sv1 && p.rsi_after == sv2;
++    return p.ret;
++}
++
++static void test_abi(void)
++{
++    static const char *const exports[] = {
++        "usb_open", "usb_close", "usb_get_string", "usb_get_string_simple",
++        "usb_get_descriptor_by_endpoint", "usb_get_descriptor", "usb_bulk_write",
++        "usb_bulk_read", "usb_interrupt_write", "usb_interrupt_read",
++        "usb_control_msg", "usb_set_configuration", "usb_claim_interface",
++        "usb_release_interface", "usb_set_altinterface", "usb_resetep",
++        "usb_clear_halt", "usb_reset", "usb_strerror", "usb_init", "usb_set_debug",
++        "usb_find_busses", "usb_find_devices", "usb_device", "usb_get_busses",
++        "usb_get_version", "usb_bulk_setup_async", "usb_interrupt_setup_async",
++        "usb_submit_async", "usb_reap_async", "usb_reap_async_nocancel",
++        "usb_cancel_async", "usb_free_async",
++    };
++    static struct usb_bus bus_ms, bus_sv;
++    static struct usb_device dev_ms, dev_sv;
++    HMODULE m = GetModuleHandleA("libusb0.dll");
++    unsigned i, found = 0, clobbered = 0;
++    const char *msg;
++    int kept;
++
++    for (i = 0; i < sizeof(exports) / sizeof(exports[0]); i++)
++        if (GetProcAddress(m, exports[i]))
++            found++;
++        else
++            INFO("missing: %s", exports[i]);
++    CHECK(found == sizeof(exports) / sizeof(exports[0]),
++          "%u of %u libusb-win32 functions exported", found,
++          (unsigned)(sizeof(exports) / sizeof(exports[0])));
++
++    /* usb_open() on a device that does not exist names it in the error */
++    strcpy(bus_ms.dirname, "rcx-bus"); strcpy(dev_ms.filename, "rcx-dev"); dev_ms.bus = &bus_ms;
++    strcpy(bus_sv.dirname, "rdi-bus"); strcpy(dev_sv.filename, "rdi-dev"); dev_sv.bus = &bus_sv;
++    usb_init();
++    probe((void *)GetProcAddress(m, "usb_open"),
++          (ULONG_PTR)&dev_ms, 0, (ULONG_PTR)&dev_sv, 0, &kept);
++    msg = usb_strerror();
++    CHECK(strstr(msg, "rcx-bus/rcx-dev") && kept,
++          "usb_open() takes its argument from rcx and keeps rdi and rsi (%s)", msg);
++
++    /* the second argument: rdx, not rsi */
++    probe((void *)GetProcAddress(m, "usb_set_configuration"), 0, 77, 0, 55, &kept);
++    msg = usb_strerror();
++    CHECK(strstr(msg, "config 77") && kept,
++          "usb_set_configuration() takes its second argument from rdx (%s)", msg);
++
++    /* every export, with poison in rdi and rsi: a System V function would
++       crash on it or clobber it */
++    for (i = 0; i < sizeof(exports) / sizeof(exports[0]); i++) {
++        void *fn = (void *)GetProcAddress(m, exports[i]);
++
++        if (!fn)
++            continue;
++        probe(fn, 0, 0, 0x5151515151515151ULL, 0x7d7d7d7d7d7d7d7dULL, &kept);
++        if (!kept) {
++            INFO("%s clobbers rdi or rsi", exports[i]);
++            clobbered++;
++        }
++    }
++    CHECK(!clobbered, "every export keeps rdi and rsi, and none crashes on NULL arguments");
++}
++
++/* ---- list ----------------------------------------------------------------- */
++
++static void test_list(int all)
++{
++    struct usb_bus *bus;
++    struct usb_device *dev, *root = NULL;
++    int listed = 0, ant = 0, receiver = 0, hub = 0, locked = 0, children = 0, i;
++
++    usb_init();
++    CHECK(usb_find_busses() >= 0 && usb_find_devices() >= 0, "enumeration succeeds");
++    for (bus = usb_get_busses(); bus; bus = bus->next) {
++        for (dev = bus->devices; dev; dev = dev->next) {
++            unsigned short v = dev->descriptor.idVendor;
++
++            INFO("%s/%s %04x:%04x", bus->dirname, dev->filename, v, dev->descriptor.idProduct);
++            listed++;
++            ant += v == ANT_VENDOR;
++            receiver += v == 0x046d;
++            hub += v == 0x1d6b;
++            locked += v == 0x8087;
++        }
++        if (bus->root_dev)
++            root = bus->root_dev;
++    }
++
++    if (!all) {
++        CHECK(ant == 1 && receiver == 1 && listed == 2,
++              "listed: the two devices this user may write to (%d listed)", listed);
++        CHECK(!hub && !locked, "not listed: the hub and the read-only device");
++        CHECK(root && root->descriptor.bDeviceClass == USB_CLASS_HUB &&
++              !strcmp(root->filename, "virtual-hub"),
++              "the bus has libusb-win32's virtual hub as its root");
++        if (root)
++            for (i = 0; i < root->num_children; i++)
++                children += root->children[i] != NULL;
++        CHECK(root && root->num_children == listed && children == listed,
++              "every listed device hangs off it (%d of %d)", children, listed);
++    } else {
++        CHECK(listed == 4, "LIBUSB0_ALL_DEVICES=1: all four devices listed");
++        CHECK(root && root->descriptor.idVendor == 0x1d6b,
++              "the real hub is the root");
++        if (root)
++            for (i = 0; i < root->num_children; i++)
++                children += root->children[i] != NULL;
++        CHECK(root && root->num_children == 3 && children == 3,
++              "with the other three devices as its children (%d)", root ? root->num_children : -1);
++    }
++    CHECK(usb_find_busses() == 0 && usb_find_devices() == 0,
++          "enumerating again reports no changes");
++}
++
++/* ---- claim ---------------------------------------------------------------- */
++
++static void test_claim(void)
++{
++    static struct usb_bus nobus;
++    static struct usb_device nodev;
++    struct usb_device *dev;
++    usb_dev_handle *h = NULL;
++
++    dev = find(ANT_VENDOR, 0);
++    CHECK(dev && (h = usb_open(dev)), "open the ANT stick");
++    if (!dev || !h)
++        return;
++    CHECK(usb_set_configuration(h, 1) == 0,
++          "asking for the configuration it is in succeeds (and changes nothing)");
++    CHECK(usb_claim_interface(h, 0) == 0,
++          "claim interface 0, which a kernel driver has: it is taken over");
++    CHECK(usb_claim_interface(h, 0) == 0, "claiming it again succeeds");
++    CHECK(usb_set_configuration(h, 2) == -EINVAL,
++          "changing the configuration with an interface claimed: -EINVAL");
++    CHECK(usb_release_interface(h, 0) == 0, "release it");
++    CHECK(usb_close(h) == 0, "close");
++
++    dev = find(0x046d, 0);
++    CHECK(dev && (h = usb_open(dev)), "open the receiver bound to usbhid");
++    if (dev && h) {
++        CHECK(usb_set_configuration(h, 1) == 0, "set its configuration: nothing to do");
++        CHECK(usb_claim_interface(h, 0) == -EIO,
++              "claiming it fails: only listed devices are taken from their driver");
++        usb_close(h);
++    }
++
++    strcpy(nobus.dirname, "001");
++    strcpy(nodev.filename, "099");
++    nodev.bus = &nobus;
++    CHECK(usb_open(&nodev) == NULL, "usb_open() of a device that is not there: NULL");
++    CHECK(usb_open(NULL) == NULL && usb_close(NULL) == -EINVAL &&
++          usb_claim_interface(NULL, 0) == -EINVAL && usb_device(NULL) == NULL,
++          "NULL handles are refused, not dereferenced");
++}
++
++/* with LIBUSB0_DETACH_KERNEL_DRIVER=0 */
++static void test_keep(void)
++{
++    struct usb_device *dev = find(ANT_VENDOR, 0);
++    usb_dev_handle *h = NULL;
++
++    CHECK(dev && (h = usb_open(dev)), "open the ANT stick");
++    if (!dev || !h)
++        return;
++    CHECK(usb_claim_interface(h, 0) == -EIO,
++          "LIBUSB0_DETACH_KERNEL_DRIVER=0: its kernel driver keeps it");
++    usb_close(h);
++}
++
++/* ---- sync ----------------------------------------------------------------- */
++
++static void test_sync(void)
++{
++    char buf[64];
++    usb_dev_handle *h = open_stick();
++    DWORD t0, dt;
++    int ret;
++
++    CHECK(h != NULL, "open, configure, claim");
++    if (!h)
++        return;
++
++    t0 = ms_now();
++    ret = usb_bulk_read(h, EP_IN, buf, sizeof(buf), 30);
++    dt = ms_now() - t0;
++    CHECK(ret == -ETRANSFER_TIMEDOUT && dt >= 25 && dt < 500,
++          "a read with nothing to read times out: %d after %lu ms", ret, dt);
++
++    ret = usb_interrupt_write(h, EP_OUT, caps_request, sizeof(caps_request), 1000);
++    CHECK(ret == sizeof(caps_request),
++          "usb_interrupt_write() to a bulk endpoint, as ANT_DLL does it: %d", ret);
++    ret = usb_bulk_read(h, EP_IN, buf, sizeof(buf), 1000);
++    CHECK(is_caps_reply(buf, ret), "usb_bulk_read() gets the reply: %d bytes", ret);
++
++    usb_bulk_write(h, EP_OUT, caps_request, sizeof(caps_request), 1000);
++    ret = usb_interrupt_read(h, EP_IN, buf, sizeof(buf), 1000);
++    CHECK(is_caps_reply(buf, ret), "usb_interrupt_read() from a bulk endpoint: %d bytes", ret);
++
++    usb_bulk_write(h, EP_OUT, caps_request, sizeof(caps_request), 1000);
++    ret = usb_bulk_read(h, EP_IN, buf, sizeof(buf), 0);
++    CHECK(is_caps_reply(buf, ret), "a timeout of 0 waits until the data comes: %d bytes", ret);
++
++    usb_close(h);
++}
++
++/* ---- async ---------------------------------------------------------------- */
++
++static void test_async(void)
++{
++    static char buf[4096];
++    usb_dev_handle *h = open_stick();
++    void *ctx = NULL;
++    DWORD t0, dt, err;
++    int ret;
++
++    CHECK(h != NULL, "open, configure, claim");
++    if (!h)
++        return;
++    CHECK(usb_bulk_setup_async(h, &ctx, EP_IN) == 0 && ctx, "set up a read");
++    CHECK(usb_submit_async(ctx, buf, sizeof(buf)) == 0, "submit it");
++    CHECK(usb_submit_async(ctx, buf, sizeof(buf)) == -EINVAL,
++          "submitting it again while it is pending: -EINVAL");
++
++    SetLastError(0);
++    t0 = ms_now();
++    ret = usb_reap_async_nocancel(ctx, 0);
++    dt = ms_now() - t0;
++    err = GetLastError();
++    CHECK(ret == -ETRANSFER_TIMEDOUT && dt < 50 && err == 121,
++          "timeout 0 checks without waiting: %d after %lu ms, last error %lu", ret, dt, err);
++
++    t0 = ms_now();
++    ret = usb_reap_async_nocancel(ctx, 100);
++    dt = ms_now() - t0;
++    CHECK(ret == -ETRANSFER_TIMEDOUT && dt >= 90 && dt < 500,
++          "a 100 ms reap times out after %lu ms and leaves the request running", dt);
++
++    usb_bulk_write(h, EP_OUT, caps_request, sizeof(caps_request), 1000);
++    ret = usb_reap_async_nocancel(ctx, 1000);
++    CHECK(is_caps_reply(buf, ret), "the same request then gets the reply: %d bytes", ret);
++    CHECK(usb_reap_async_nocancel(ctx, 0) == ret,
++          "reaping a finished request again gives the same result");
++
++    usb_submit_async(ctx, buf, sizeof(buf));
++    t0 = ms_now();
++    ret = usb_reap_async(ctx, 50);
++    dt = ms_now() - t0;
++    CHECK(ret == -ETRANSFER_TIMEDOUT && dt >= 40 && dt < 500,
++          "usb_reap_async() times out after %lu ms", dt);
++    ret = usb_reap_async_nocancel(ctx, 0);
++    err = GetLastError();
++    CHECK(ret == -ETRANSFER_TIMEDOUT && err == ERROR_OPERATION_ABORTED,
++          "and has cancelled it: %d, last error %lu", ret, err);
++
++    usb_submit_async(ctx, buf, sizeof(buf));
++    CHECK(usb_cancel_async(ctx) == 0, "usb_cancel_async()");
++    t0 = ms_now();
++    ret = usb_reap_async_nocancel(ctx, 1000);
++    dt = ms_now() - t0;
++    err = GetLastError();
++    CHECK(ret == -ETRANSFER_TIMEDOUT && err == ERROR_OPERATION_ABORTED && dt < 50,
++          "a cancelled request reaps at once as aborted: %d, last error %lu", ret, err);
++
++    usb_submit_async(ctx, buf, sizeof(buf));
++    CHECK(usb_free_async(&ctx) == 0 && ctx == NULL, "free a context with its request pending");
++    usb_bulk_setup_async(h, &ctx, EP_IN);
++    usb_submit_async(ctx, buf, sizeof(buf));
++    usb_bulk_write(h, EP_OUT, caps_request, sizeof(caps_request), 1000);
++    ret = usb_reap_async_nocancel(ctx, 1000);
++    CHECK(is_caps_reply(buf, ret), "the freed request did not take the next reply: %d", ret);
++
++    usb_free_async(&ctx);
++    usb_release_interface(h, 0);
++    usb_bulk_setup_async(h, &ctx, EP_IN);
++    CHECK(usb_submit_async(ctx, buf, sizeof(buf)) == -EINVAL,
++          "submitting with no interface claimed: -EINVAL, as in libusb-win32");
++    usb_free_async(&ctx);
++    usb_close(h);
++}
++
++/* ---- threads -------------------------------------------------------------- */
++
++struct reaper {
++    void *ctx;
++    int timeout, ret;
++    DWORD error, ms;
++    char buf[4096];
++};
++
++static DWORD WINAPI reaper_thread(LPVOID arg)
++{
++    struct reaper *r = arg;
++    DWORD t0 = ms_now();
++
++    r->ret = usb_reap_async_nocancel(r->ctx, r->timeout);
++    r->error = GetLastError();
++    r->ms = ms_now() - t0;
++    return 0;
++}
++
++static void test_threads(void)
++{
++    static struct reaper a, b;
++    usb_dev_handle *h = open_stick();
++    HANDLE ta, tb;
++    DWORD t0, dt;
++    int ret;
++
++    CHECK(h != NULL, "open, configure, claim");
++    if (!h)
++        return;
++
++    usb_bulk_setup_async(h, &a.ctx, EP_IN);
++    usb_bulk_setup_async(h, &b.ctx, EP_IN);
++    a.timeout = b.timeout = 2000;
++    usb_submit_async(a.ctx, a.buf, sizeof(a.buf));
++    usb_submit_async(b.ctx, b.buf, sizeof(b.buf));
++    ta = CreateThread(NULL, 0, reaper_thread, &a, 0, NULL);
++    tb = CreateThread(NULL, 0, reaper_thread, &b, 0, NULL);
++    Sleep(50);
++    usb_interrupt_write(h, EP_OUT, caps_request, sizeof(caps_request), 1000);
++    usb_interrupt_write(h, EP_OUT, caps_request, sizeof(caps_request), 1000);
++    WaitForSingleObject(ta, 3000);
++    WaitForSingleObject(tb, 3000);
++    CHECK(is_caps_reply(a.buf, a.ret) && is_caps_reply(b.buf, b.ret) && a.ms < 500 && b.ms < 500,
++          "two threads reaping at once each get their reply (%lu ms, %lu ms)", a.ms, b.ms);
++
++    /* a write on this thread while the other keeps a read pending */
++    usb_submit_async(a.ctx, a.buf, sizeof(a.buf));
++    a.timeout = 2000;
++    ta = CreateThread(NULL, 0, reaper_thread, &a, 0, NULL);
++    Sleep(20);
++    ret = usb_bulk_write(h, EP_OUT, caps_request, sizeof(caps_request), 1000);
++    WaitForSingleObject(ta, 3000);
++    CHECK(ret == sizeof(caps_request) && is_caps_reply(a.buf, a.ret),
++          "a write while another thread reaps: the reply goes to the reaper");
++
++    usb_submit_async(a.ctx, a.buf, sizeof(a.buf));
++    a.timeout = -1;
++    ta = CreateThread(NULL, 0, reaper_thread, &a, 0, NULL);
++    Sleep(100);
++    t0 = ms_now();
++    usb_close(h);
++    dt = ms_now() - t0;
++    ret = WaitForSingleObject(ta, 2000);
++    CHECK(ret == WAIT_OBJECT_0 && a.ret == -ETRANSFER_TIMEDOUT &&
++          a.error == ERROR_OPERATION_ABORTED && dt < 500,
++          "usb_close() ends a reap that waits for ever, as aborted (close took %lu ms)", dt);
++    CHECK(usb_free_async(&a.ctx) == 0 && usb_free_async(&b.ctx) == 0,
++          "the contexts can still be freed after the close");
++}
++
++/* ---- unplug --------------------------------------------------------------- */
++
++static usb_dev_handle *loop_handle;
++static volatile LONG loop_stop, loop_aborts, loop_errors, loop_reads;
++static DWORD loop_end;
++
++/* ANT_DLL's receive loop, USBDeviceHandleLibusb::ReceiveThread() */
++static DWORD WINAPI receive_loop(LPVOID unused)
++{
++    static char data[4096];
++    void *ctx = NULL;
++    int submitted = 0, errors_in_a_row = 0, ret;
++
++    (void)unused;
++    usb_bulk_setup_async(loop_handle, &ctx, EP_IN);
++    while (!loop_stop) {
++        if (!submitted) {
++            if (usb_submit_async(ctx, data, sizeof(data)) < 0) {
++                loop_errors++;
++                break;
++            }
++            submitted = 1;
++        }
++        ret = usb_reap_async_nocancel(ctx, 1000);
++        if (ret > 0) {
++            loop_reads++;
++            submitted = 0;
++            errors_in_a_row = 0;
++        } else if (ret == -ETRANSFER_TIMEDOUT) {
++            if (GetLastError() == ERROR_OPERATION_ABORTED) {
++                loop_aborts++;                  /* "the stick lost power" */
++                break;
++            }
++        } else if (ret < 0) {
++            loop_errors++;
++            if (++errors_in_a_row == 10)
++                break;
++            if (usb_cancel_async(ctx) || usb_free_async(&ctx) ||
++                usb_bulk_setup_async(loop_handle, &ctx, EP_IN))
++                break;
++            submitted = 0;
++        }
++    }
++    loop_end = ms_now();
++    usb_cancel_async(ctx);
++    usb_free_async(&ctx);
++    return 0;
++}
++
++/* the emulator pulls the stick out 1.5 s after the claim */
++static void test_unplug(void)
++{
++    HANDLE t;
++    DWORD t0;
++    int ret;
++
++    loop_handle = open_stick();
++    CHECK(loop_handle != NULL, "open, configure, claim");
++    if (!loop_handle)
++        return;
++    t0 = ms_now();
++    t = CreateThread(NULL, 0, receive_loop, NULL, 0, NULL);
++    while (ms_now() - t0 < 1300) {
++        usb_interrupt_write(loop_handle, EP_OUT, caps_request, sizeof(caps_request), 1000);
++        Sleep(20);
++    }
++    CHECK(WaitForSingleObject(t, 2500) == WAIT_OBJECT_0, "the receive loop ends after the unplug");
++    CHECK(loop_aborts == 1 && loop_errors == 0 && loop_reads > 0,
++          "with the abort ANT_DLL restarts a stick on (%ld aborts, %ld errors, %ld reads)",
++          loop_aborts, loop_errors, loop_reads);
++    CHECK(loop_end - t0 < 1500 + 400, "within %ld ms of the unplug", (long)(loop_end - t0) - 1500);
++    ret = usb_interrupt_write(loop_handle, EP_OUT, caps_request, sizeof(caps_request), 1000);
++    CHECK(ret == -EIO, "writing to the missing stick fails at once: %d", ret);
++    CHECK(usb_close(loop_handle) == 0, "close it");
++}
++
++/* ---- cycles --------------------------------------------------------------- */
++
++/* open file descriptors of this (Wine) process, through Z:, which is / */
++static int count_fds(void)
++{
++    WIN32_FIND_DATAA fd;
++    HANDLE f = FindFirstFileA("Z:\\proc\\self\\fd\\*", &fd);
++    int n = 0;
++
++    if (f == INVALID_HANDLE_VALUE)
++        return -1;
++    do
++        n++;
++    while (FindNextFileA(f, &fd));
++    FindClose(f);
++    return n;
++}
++
++static void test_cycles(void)
++{
++    static char buf[4096];
++    int i, before, after, with_data = 0;
++    usb_dev_handle *h;
++    void *ctx;
++
++    h = open_stick();                   /* first use allocates for good */
++    if (h)
++        usb_close(h);
++    before = count_fds();
++    for (i = 0; i < 300; i++) {
++        if (!(h = open_stick()))
++            break;
++        ctx = NULL;
++        usb_bulk_setup_async(h, &ctx, EP_IN);
++        usb_submit_async(ctx, buf, sizeof(buf));
++        if (i % 3 == 0) {
++            usb_interrupt_write(h, EP_OUT, caps_request, sizeof(caps_request), 1000);
++            with_data += usb_reap_async_nocancel(ctx, 1000) > 0;
++        } else if (i % 3 == 1)
++            usb_cancel_async(ctx);
++        usb_free_async(&ctx);           /* every third one still pending */
++        usb_close(h);
++    }
++    after = count_fds();
++    CHECK(i == 300 && with_data == 100, "300 open/use/close cycles, 100 of them with data");
++    CHECK(before > 0 && after <= before, "no file descriptor leaked: %d before, %d after",
++          before, after);
++}
++
++/* ---- ant ------------------------------------------------------------------ */
++
++/* USBDeviceHandleLibusb::TryOpen(): ANT_DLL runs it on every listed device */
++static int try_open(struct usb_device *dev)
++{
++    usb_dev_handle *h = usb_open(dev);
++    int ok;
++
++    if (!h)
++        return 0;
++    ok = usb_set_configuration(h, 1) == 0 && usb_claim_interface(h, 0) == 0;
++    if (ok)
++        usb_release_interface(h, 0);
++    usb_close(h);
++    return ok;
++}
++
++static void test_ant(void)
++{
++    struct usb_bus *bus;
++    struct usb_device *dev, *stick = NULL;
++    char name[64];
++    int openable = 0, i, ok = 0;
++    HANDLE t;
++    DWORD t0, worst = 0;
++
++    /* USBDeviceHandleLibusb::GetAllDevices() and GetAvailableDevices() */
++    usb_init();
++    usb_find_busses();
++    usb_find_devices();
++    for (bus = usb_get_busses(); bus; bus = bus->next)
++        for (dev = bus->devices; dev; dev = dev->next) {
++            usb_dev_handle *h = usb_open(dev);
++
++            if (h) {        /* USBDeviceLibusb reads the strings of every device */
++                usb_get_string_simple(h, dev->descriptor.iProduct, name, sizeof(name));
++                usb_close(h);
++            }
++            if (try_open(dev)) {
++                openable++;
++                if (dev->descriptor.idVendor == ANT_VENDOR)
++                    stick = dev;
++            }
++        }
++    CHECK(stick && openable == 1, "trial-opening every device finds the stick, and only it");
++    if (!stick)
++        return;
++
++    /* POpen(), then the receive thread, then requests from this thread */
++    loop_handle = usb_open(stick);
++    CHECK(loop_handle && usb_set_configuration(loop_handle, 1) == 0 &&
++          usb_claim_interface(loop_handle, 0) == 0, "open the stick the way POpen() does");
++    if (!loop_handle)
++        return;
++    loop_stop = loop_aborts = loop_errors = loop_reads = 0;
++    t = CreateThread(NULL, 0, receive_loop, NULL, 0, NULL);
++    for (i = 0; i < 200; i++) {
++        LONG before = loop_reads;
++        DWORD t1 = ms_now();
++
++        if (usb_interrupt_write(loop_handle, EP_OUT, caps_request, sizeof(caps_request), 3000) != 6)
++            break;
++        while (loop_reads == before && ms_now() - t1 < 1000)
++            Sleep(0);
++        if (loop_reads != before) {
++            ok++;
++            if (ms_now() - t1 > worst)
++                worst = ms_now() - t1;
++        }
++    }
++    CHECK(ok == 200, "200 request/reply round trips through the receive thread (worst %lu ms)",
++          worst);
++
++    /* PClose(): stop the thread, which ANT_DLL kills if it takes 3 s */
++    t0 = ms_now();
++    loop_stop = 1;
++    CHECK(WaitForSingleObject(t, 3000) == WAIT_OBJECT_0 && loop_errors == 0,
++          "the receive thread stops in %lu ms, without errors", ms_now() - t0);
++    usb_release_interface(loop_handle, 0);
++    usb_close(loop_handle);
++
++    CHECK(try_open(stick), "and the stick opens again afterwards");
++}
++
++/* ---- main ----------------------------------------------------------------- */
++
++int main(int argc, char **argv)
++{
++    static const struct { const char *name; void (*run)(void); } tests[] = {
++        { "abi", test_abi }, { "claim", test_claim }, { "keep", test_keep },
++        { "sync", test_sync }, { "async", test_async }, { "threads", test_threads },
++        { "unplug", test_unplug }, { "cycles", test_cycles }, { "ant", test_ant },
++    };
++    int i, j;
++
++    setvbuf(stdout, NULL, _IONBF, 0);
++    if (argc < 2) {
++        fprintf(stderr, "usage: libusb0-test TEST...\n");
++        return 2;
++    }
++    for (i = 1; i < argc; i++) {
++        printf("%s\n", argv[i]);
++        if (!strcmp(argv[i], "list") || !strcmp(argv[i], "list-all")) {
++            test_list(argv[i][4] != 0);
++            continue;
++        }
++        for (j = 0; j < (int)(sizeof(tests) / sizeof(tests[0])); j++)
++            if (!strcmp(argv[i], tests[j].name))
++                break;
++        if (j == (int)(sizeof(tests) / sizeof(tests[0]))) {
++            fprintf(stderr, "no test called %s\n", argv[i]);
++            return 2;
++        }
++        tests[j].run();
++    }
++    return failures ? 1 : 0;
++}
+diff --git a/tests/run.sh b/tests/run.sh
+new file mode 100755
+index 0000000..bec8938
+--- /dev/null
++++ b/tests/run.sh
+@@ -0,0 +1,122 @@
++#!/bin/sh
++# Build the library, the usbfs emulator and the test program, then run
++# every test under Wine against the emulated devices. No USB device needed.
++#
++#   tests/run.sh
++#   WINE=/opt/wine-staging/bin/wine tests/run.sh
++#
++# Needs gcc, mingw-w64 (x86_64-w64-mingw32-gcc and -dlltool) and Wine with
++# its development files. winegcc, winebuild and the Windows headers are
++# looked for next to $WINE; on Debian and Ubuntu, with their own Wine:
++#
++#   WINEGCC=/usr/lib/wine/winegcc WINEBUILD=/usr/lib/wine/winebuild \
++#   WINE_INCLUDE=/usr/include/wine/wine/windows tests/run.sh
++#
++# The tests run in a new Wine prefix that is deleted afterwards; set
++# TEST_WINEPREFIX to keep one between runs. Nothing is installed: the
++# library is found through WINEDLLPATH, and its placeholder sits next to
++# the test program.
++
++set -eu
++
++here=$(cd "$(dirname "$0")" && pwd)
++src=$here/../src
++WINE=${WINE:-wine}
++wine=$(command -v "$WINE") || { echo "no Wine: set WINE" >&2; exit 1; }
++bindir=$(dirname "$wine")
++WINEGCC=${WINEGCC:-$bindir/winegcc}
++WINEBUILD=${WINEBUILD:-$bindir/winebuild}
++WINE_INCLUDE=${WINE_INCLUDE:-$bindir/../include/wine/windows}
++WINESERVER=${WINESERVER:-$bindir/wineserver}
++MINGW=${MINGW:-x86_64-w64-mingw32}
++
++out=$(mktemp -d "${TMPDIR:-/tmp}/libusb0-test.XXXXXX")
++prefix=${TEST_WINEPREFIX:-$out/prefix}
++cleanup() {
++    WINEPREFIX=$prefix "$WINESERVER" -k 2>/dev/null || true
++    rm -rf "$out"
++}
++trap cleanup EXIT
++
++echo "Building in $out"
++mkdir -p "$out/build" "$out/bin" "$out/lib/x86_64-unix"
++cp "$src"/*.c "$src"/*.h "$src"/libusb0.spec "$src"/Makefile.x64 "$out/build/"
++make -s -C "$out/build" -f Makefile.x64 all libusb0.def \
++    WINE_INCLUDE="$WINE_INCLUDE" WINEGCC="$WINEGCC" WINEBUILD="$WINEBUILD"
++cp "$out/build/libusb0.dll.so" "$out/lib/x86_64-unix/"
++cp "$out/build/libusb0.dll.fake" "$out/bin/libusb0.dll"
++"$MINGW-dlltool" -d "$out/build/libusb0.def" -D libusb0.dll -l "$out/build/libusb0.a"
++"$MINGW-gcc" -O2 -Wall -Wextra -I"$src" -o "$out/bin/libusb0-test.exe" \
++    "$here/libusb0-test.c" "$out/build/libusb0.a"
++# _FORTIFY_SOURCE would turn the open() it defines into a clash
++gcc -O2 -Wall -Wextra -fPIC -shared -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 \
++    -o "$out/usbemu.so" "$here/usbemu.c" -ldl -lpthread
++gcc -O2 -Wall -Wextra -DUSBEMU_MKTREE -o "$out/usbemu-mktree" "$here/usbemu.c"
++
++echo "Preparing a Wine prefix"
++WINEPREFIX=$prefix WINEDEBUG=-all "$WINE" wineboot -i >/dev/null 2>&1 || true
++WINEPREFIX=$prefix "$WINESERVER" -w 2>/dev/null || true
++
++failed=0
++
++# run NAME 'VAR=value ...' TEST... : run tests against a fresh device tree
++run() {
++    name=$1 settings=$2
++    shift 2
++    tree=$out/usb-$name
++    "$out/usbemu-mktree" "$tree"
++    : >"$out/$name.log"
++    echo
++    echo "== $name${settings:+ ($settings)}"
++    # shellcheck disable=SC2086  # the settings are split into words on purpose
++    env $settings USBEMU_ROOT="$tree" USB_DEVFS_PATH="$tree" USBEMU_LOG="$out/$name.log" \
++        WINEPREFIX="$prefix" WINEDEBUG=-all WINEDLLOVERRIDES=libusb0=b \
++        WINEDLLPATH="$out/lib" LD_PRELOAD="$out/usbemu.so" \
++        timeout 180 "$WINE" "$out/bin/libusb0-test.exe" "$@" </dev/null \
++        >"$out/$name.out" 2>&1 || echo "  FAIL  exit status $?" >>"$out/$name.out"
++    tr -d '\r' <"$out/$name.out" | grep -v '^$' || true
++    if grep -q "FAIL" "$out/$name.out"; then failed=$((failed + 1)); fi
++}
++
++# expect NAME PATTERN, refuse NAME PATTERN: what the devices must, or must
++# not, have seen during run NAME
++expect() {
++    if grep -q "$2" "$out/$1.log"; then
++        echo "  PASS  the devices saw: $2"
++    else
++        echo "  FAIL  the devices never saw: $2"
++        failed=$((failed + 1))
++    fi
++}
++refuse() {
++    if grep -q "$2" "$out/$1.log"; then
++        echo "  FAIL  the devices saw: $(grep "$2" "$out/$1.log" | head -n 1)"
++        failed=$((failed + 1))
++    else
++        echo "  PASS  the devices never saw: $2"
++    fi
++}
++
++run abi '' abi
++run list '' list
++refuse list 'claim\|setconfig\|detach'
++run list-all 'LIBUSB0_ALL_DEVICES=1' list-all
++run claim 'USBEMU_DRIVER=usb_serial_simple' claim
++expect claim 'detach usb_serial_simple from 001/005'
++refuse claim 'setconfig\|detach usbhid'
++run keep 'USBEMU_DRIVER=usb_serial_simple LIBUSB0_DETACH_KERNEL_DRIVER=0' keep
++refuse keep 'detach'
++run transfers '' sync async threads
++run unplug 'USBEMU_UNPLUG_MS=1500 USBEMU_TRAFFIC_HZ=50' unplug
++expect unplug 'unplug 001/005'
++run cycles '' cycles
++run ant 'USBEMU_DRIVER=usb_serial_simple' ant
++refuse ant 'setconfig\|detach usbhid'
++
++echo
++if [ "$failed" -eq 0 ]; then
++    echo "ALL TESTS PASSED"
++else
++    echo "$failed FAILED"
++    exit 1
++fi
+diff --git a/tests/usbemu.c b/tests/usbemu.c
+new file mode 100644
+index 0000000..39e9e2d
+--- /dev/null
++++ b/tests/usbemu.c
+@@ -0,0 +1,1025 @@
++/*
++ * usbemu: Linux usbfs emulated in user space, for testing libusb0.dll.so
++ * without hardware. It is preloaded (LD_PRELOAD) into Wine, intercepts
++ * open(), close(), ioctl() and poll() on the device nodes of a fake
++ * /dev/bus/usb tree, and behaves the way drivers/usb/core/devio.c does in
++ * the ways the library depends on:
++ *
++ *  - one completion list per open file, reaped with REAPURB(NDELAY), and
++ *    poll() reporting POLLOUT while it is not empty
++ *  - DISCARDURB, which fails with EINVAL once the URB has finished
++ *  - USBDEVFS_BULK, which waits for its transfer without going through
++ *    the completion list
++ *  - an interrupt URB refused on a bulk endpoint, a bulk URB accepted on
++ *    an interrupt one
++ *  - interfaces claimed by kernel drivers or by other files (EBUSY),
++ *    DISCONNECT_CLAIM, and SETCONFIGURATION refused while any is claimed
++ *  - every request refused (EPERM) on a file opened read-only
++ *  - unplugging: pending URBs complete, poll() reports POLLHUP, reaps
++ *    return ENODEV once nothing is left, everything else fails with ENODEV
++ *
++ * The devices, on bus 001:
++ *   005  0fcf:1009 ANT USB-m stick that answers ANT requests (writable)
++ *   006  046d:c52b receiver bound to usbhid, which must be left alone
++ *   001  root hub (writable here, to check that hubs are not listed)
++ *   007  a device this user cannot open for writing
++ *
++ * Built twice from this file: as the preload library, and with
++ * -DUSBEMU_MKTREE as the tool that writes the device tree (the nodes are
++ * plain files holding each device's descriptors).
++ *
++ * Environment:
++ *   USBEMU_ROOT        the tree; point USB_DEVFS_PATH at it too
++ *   USBEMU_LOG         append what the devices see to this file
++ *   USBEMU_DRIVER      bind the ANT stick to this kernel driver
++ *   USBEMU_TRAFFIC_HZ  unsolicited ANT broadcasts per second
++ *   USBEMU_UNPLUG_MS   unplug the ANT stick this long after its first claim
++ */
++#define _GNU_SOURCE
++#include <dlfcn.h>
++#include <errno.h>
++#include <fcntl.h>
++#include <poll.h>
++#include <pthread.h>
++#include <stdarg.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/eventfd.h>
++#include <sys/ioctl.h>
++#include <sys/stat.h>
++#include <time.h>
++#include <unistd.h>
++#include <linux/usbdevice_fs.h>
++
++#define LE16(x) ((x) & 0xff), (((x) >> 8) & 0xff)
++
++enum { EP_BULK = 2, EP_INTERRUPT = 3 };
++
++struct endpoint {
++    unsigned char address, type;
++};
++
++struct device {
++    const char *node;               /* bus/device under USBEMU_ROOT */
++    int devnum;
++    int writable;                   /* may this user open it read-write? */
++    int is_ant;
++    unsigned char descriptors[18 + 64];
++    int descriptors_len;
++    struct endpoint endpoints[2];
++    int nendpoints;
++    const char *strings[4];         /* string descriptors 1..3 */
++    unsigned char ports[4];         /* a hub's ports: devnums, 0 = empty */
++    /* state */
++    char driver[64];                /* kernel driver on interface 0, "" none */
++    struct file *claimed_by;        /* file holding interface 0, or NULL */
++    int config;
++    int unplugged;
++    unsigned char rx[512];          /* ANT: bytes received, not yet parsed */
++    int rx_len;
++};
++
++static struct device devices[] = {
++    {
++        "001/005", 5, 1, 1,
++        { 18, 1, LE16(0x0200), 0, 0, 0, 32, LE16(0x0fcf), LE16(0x1009),
++          LE16(0x0100), 1, 2, 3, 1,
++          9, 2, LE16(32), 1, 1, 0, 0x80, 50,
++          9, 4, 0, 0, 2, 0xff, 0, 0, 0,
++          7, 5, 0x81, EP_BULK, LE16(64), 1,
++          7, 5, 0x01, EP_BULK, LE16(64), 1 },
++        18 + 32, { { 0x81, EP_BULK }, { 0x01, EP_BULK } }, 2,
++        { NULL, "Dynastream Innovations", "ANT USBStick2", "123" },
++        { 0 }, "", NULL, 1, 0, { 0 }, 0
++    },
++    {
++        "001/006", 6, 1, 0,
++        { 18, 1, LE16(0x0200), 0, 0, 0, 8, LE16(0x046d), LE16(0xc52b),
++          LE16(0x1211), 1, 2, 0, 1,
++          9, 2, LE16(25), 1, 1, 0, 0xa0, 49,
++          9, 4, 0, 0, 1, 3, 1, 1, 0,
++          7, 5, 0x81, EP_INTERRUPT, LE16(8), 8 },
++        18 + 25, { { 0x81, EP_INTERRUPT } }, 1,
++        { NULL, "Logitech", "USB Receiver", NULL },
++        { 0 }, "usbhid", NULL, 1, 0, { 0 }, 0
++    },
++    {
++        "001/001", 1, 1, 0,
++        { 18, 1, LE16(0x0200), 9, 0, 1, 64, LE16(0x1d6b), LE16(0x0002),
++          LE16(0x0608), 3, 2, 1, 1,
++          9, 2, LE16(25), 1, 1, 0, 0xe0, 0,
++          9, 4, 0, 0, 1, 9, 0, 0, 0,
++          7, 5, 0x81, EP_INTERRUPT, LE16(4), 12 },
++        18 + 25, { { 0x81, EP_INTERRUPT } }, 1,
++        { NULL, "Linux", "xHCI Host Controller", "0000:00:14.0" },
++        { 5, 6, 7, 0 }, "hub", NULL, 1, 0, { 0 }, 0
++    },
++    {
++        "001/007", 7, 0, 0,
++        { 18, 1, LE16(0x0200), 0xe0, 1, 1, 64, LE16(0x8087), LE16(0x0029),
++          LE16(0x0001), 0, 0, 0, 1,
++          9, 2, LE16(25), 1, 1, 0, 0xe0, 0,
++          9, 4, 0, 0, 1, 0xe0, 1, 1, 0,
++          7, 5, 0x81, EP_INTERRUPT, LE16(16), 1 },
++        18 + 25, { { 0x81, EP_INTERRUPT } }, 1,
++        { NULL, NULL, NULL, NULL },
++        { 0 }, "btusb", NULL, 1, 0, { 0 }, 0
++    },
++};
++#define NDEVICES ((int)(sizeof(devices) / sizeof(devices[0])))
++#define ANT (&devices[0])
++
++#ifdef USBEMU_MKTREE
++
++int main(int argc, char **argv)
++{
++    char path[4096];
++    int i;
++
++    if (argc != 2) {
++        fprintf(stderr, "usage: %s DIR\n", argv[0]);
++        return 2;
++    }
++    mkdir(argv[1], 0755);
++    snprintf(path, sizeof(path), "%s/001", argv[1]);
++    mkdir(path, 0755);
++    for (i = 0; i < NDEVICES; i++) {
++        FILE *f;
++
++        snprintf(path, sizeof(path), "%s/%s", argv[1], devices[i].node);
++        if (!(f = fopen(path, "wb"))) {
++            perror(path);
++            return 1;
++        }
++        fwrite(devices[i].descriptors, 1, devices[i].descriptors_len, f);
++        fclose(f);
++    }
++    return 0;
++}
++
++#else
++
++/* ---- state -------------------------------------------------------------- */
++
++/* A request: an async URB, or a synchronous IN transfer waiting for data */
++struct urb {
++    struct file *file;
++    struct usbdevfs_urb *user;      /* the program's URB, written at reap */
++    unsigned char endpoint;
++    void *user_buffer;
++    unsigned char *data;            /* the "kernel" copy of the data */
++    int length, actual, status;
++    int sync, done;
++    struct urb *next;               /* the file's pending or completed list */
++    struct urb *queue_next;         /* the ANT stick's IN queue */
++};
++
++/* An open device file */
++struct file {
++    int fd;
++    int writable;
++    struct device *device;
++    int ready;                      /* eventfd, readable while URBs wait */
++    int ready_set;
++    struct urb *pending;
++    struct urb *completed, *completed_tail;
++    struct file *next;
++};
++
++/* An ANT message on its way to the host */
++struct message {
++    unsigned char bytes[64];
++    int len;
++    struct timespec due;
++    struct message *next;
++};
++
++static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
++static pthread_cond_t changed = PTHREAD_COND_INITIALIZER;
++static struct file *files;
++static unsigned char tracked[65536];        /* fd -> is a device file */
++static struct urb *in_queue, *in_queue_tail; /* the ANT stick's IN requests */
++static struct message *outbox;               /* ANT messages, by due time */
++static int device_thread_started;
++static char root[1024];
++static FILE *log_file;
++static int traffic_hz, unplug_ms, unplug_armed;
++static struct timespec unplug_at;
++
++static int (*real_open)(const char *, int, ...);
++static int (*real_openat)(int, const char *, int, ...);
++static int (*real_close)(int);
++static int (*real_ioctl)(int, unsigned long, ...);
++static int (*real_poll)(struct pollfd *, nfds_t, int);
++
++static void log_event(const char *format, ...)
++{
++    va_list args;
++
++    if (!log_file)
++        return;
++    va_start(args, format);
++    vfprintf(log_file, format, args);
++    va_end(args);
++    fputc('\n', log_file);
++    fflush(log_file);
++}
++
++__attribute__((constructor)) static void init(void)
++{
++    const char *v;
++
++    real_open = dlsym(RTLD_NEXT, "open");
++    real_openat = dlsym(RTLD_NEXT, "openat");
++    real_close = dlsym(RTLD_NEXT, "close");
++    real_ioctl = dlsym(RTLD_NEXT, "ioctl");
++    real_poll = dlsym(RTLD_NEXT, "poll");
++    if ((v = getenv("USBEMU_ROOT")))
++        snprintf(root, sizeof(root), "%s", v);
++    if ((v = getenv("USBEMU_LOG")))
++        log_file = fopen(v, "a");
++    if ((v = getenv("USBEMU_DRIVER")) && *v)
++        snprintf(ANT->driver, sizeof(ANT->driver), "%s", v);
++    if ((v = getenv("USBEMU_TRAFFIC_HZ")))
++        traffic_hz = atoi(v);
++    if ((v = getenv("USBEMU_UNPLUG_MS")))
++        unplug_ms = atoi(v);
++}
++
++static void add_us(struct timespec *ts, long us)
++{
++    ts->tv_nsec += (us % 1000000) * 1000;
++    ts->tv_sec += us / 1000000 + ts->tv_nsec / 1000000000;
++    ts->tv_nsec %= 1000000000;
++}
++
++static int before(const struct timespec *a, const struct timespec *b)
++{
++    return a->tv_sec < b->tv_sec || (a->tv_sec == b->tv_sec && a->tv_nsec < b->tv_nsec);
++}
++
++static struct file *file_of(int fd)
++{
++    struct file *f;
++
++    if (fd < 0 || fd >= 65536 || !tracked[fd])
++        return NULL;
++    for (f = files; f; f = f->next)
++        if (f->fd == fd)
++            return f;
++    return NULL;
++}
++
++/* The eventfd stands in for the file in poll(): readable while URBs wait. */
++static void update_ready(struct file *f)
++{
++    uint64_t v = 1;
++    int want = f->completed || f->device->unplugged;
++
++    if (want && !f->ready_set) {
++        if (write(f->ready, &v, sizeof(v)) == sizeof(v))
++            f->ready_set = 1;
++    } else if (!want && f->ready_set) {
++        if (read(f->ready, &v, sizeof(v)) == sizeof(v))
++            f->ready_set = 0;
++    }
++}
++
++static void unlink_from(struct urb **list, struct urb *u)
++{
++    for (; *list; list = &(*list)->next)
++        if (*list == u) {
++            *list = u->next;
++            break;
++        }
++    u->next = NULL;
++}
++
++static void unqueue(struct urb *u)
++{
++    struct urb **p, *prev = NULL;
++
++    for (p = &in_queue; *p; prev = *p, p = &(*p)->queue_next)
++        if (*p == u) {
++            *p = u->queue_next;
++            if (in_queue_tail == u)
++                in_queue_tail = prev;
++            break;
++        }
++    u->queue_next = NULL;
++}
++
++static void enqueue(struct urb *u)
++{
++    if (in_queue_tail)
++        in_queue_tail->queue_next = u;
++    else
++        in_queue = u;
++    in_queue_tail = u;
++}
++
++/* A request finished: an async URB moves to its file's completed list. */
++static void complete(struct urb *u, int status)
++{
++    struct file *f = u->file;
++
++    u->status = status;
++    u->done = 1;
++    unqueue(u);
++    if (!u->sync) {
++        unlink_from(&f->pending, u);
++        if (f->completed_tail)
++            f->completed_tail->next = u;
++        else
++            f->completed = u;
++        f->completed_tail = u;
++        update_ready(f);
++    }
++    pthread_cond_broadcast(&changed);
++}
++
++/* ---- the ANT stick -------------------------------------------------------- */
++
++static void send_message(unsigned char id, const unsigned char *data, int len, long delay_us)
++{
++    struct message *m = calloc(1, sizeof(*m)), **p;
++    unsigned char sum = 0;
++    int i;
++
++    m->bytes[0] = 0xa4;
++    m->bytes[1] = len;
++    m->bytes[2] = id;
++    memcpy(m->bytes + 3, data, len);
++    for (i = 0; i < 3 + len; i++)
++        sum ^= m->bytes[i];
++    m->bytes[3 + len] = sum;
++    m->len = 4 + len;
++    clock_gettime(CLOCK_MONOTONIC, &m->due);
++    add_us(&m->due, delay_us);
++    for (p = &outbox; *p && !before(&m->due, &(*p)->due); p = &(*p)->next)
++        ;
++    m->next = *p;
++    *p = m;
++    pthread_cond_broadcast(&changed);
++}
++
++/* Bytes from the host: answer the requests ANT_DLL makes when it opens a stick. */
++static void ant_receive(struct device *d, const unsigned char *bytes, int n)
++{
++    static const unsigned char startup[] = { 0x20 };
++    static const unsigned char capabilities[] = { 8, 8, 0x00, 0xba, 0x36, 0x00, 0xdf, 0x0f };
++    static const unsigned char serial[] = { 0x78, 0x56, 0x34, 0x12 };
++    static const unsigned char version[] = "AOD1.10B00";
++
++    if (d->rx_len + n > (int)sizeof(d->rx))
++        d->rx_len = 0;
++    memcpy(d->rx + d->rx_len, bytes, n);
++    d->rx_len += n;
++
++    for (;;) {
++        int start = 0, len, i;
++        unsigned char sum = 0;
++
++        while (start < d->rx_len && d->rx[start] != 0xa4)
++            start++;
++        memmove(d->rx, d->rx + start, d->rx_len - start);
++        d->rx_len -= start;
++        if (d->rx_len < 4 || d->rx_len < 4 + (len = d->rx[1]))
++            return;
++        for (i = 0; i < 3 + len; i++)
++            sum ^= d->rx[i];
++        if (sum == d->rx[3 + len]) {
++            unsigned char id = d->rx[2], *data = d->rx + 3;
++
++            if (id == 0x4a)                                     /* reset */
++                send_message(0x6f, startup, sizeof(startup), 2000);
++            else if (id == 0x4d && len >= 2 && data[1] == 0x54) /* request */
++                send_message(0x54, capabilities, sizeof(capabilities), 300);
++            else if (id == 0x4d && len >= 2 && data[1] == 0x61)
++                send_message(0x61, serial, sizeof(serial), 300);
++            else if (id == 0x4d && len >= 2 && data[1] == 0x3e)
++                send_message(0x3e, version, sizeof(version), 300);
++        }
++        memmove(d->rx, d->rx + 4 + len, d->rx_len - (4 + len));
++        d->rx_len -= 4 + len;
++    }
++}
++
++static void unplug(struct device *d)
++{
++    struct file *f;
++
++    d->unplugged = 1;
++    log_event("unplug %s", d->node);
++    /* the kernel kills everything in flight, and it lands as completed */
++    while (in_queue)
++        complete(in_queue, in_queue->sync ? -ESHUTDOWN : -ENOENT);
++    for (f = files; f; f = f->next)
++        if (f->device == d) {
++            while (f->pending)
++                complete(f->pending, -ENOENT);
++            update_ready(f);
++        }
++}
++
++/* Hand due messages to waiting IN requests, one message per transfer. */
++static void deliver(void)
++{
++    struct timespec now;
++
++    clock_gettime(CLOCK_MONOTONIC, &now);
++    if (unplug_armed && !ANT->unplugged && !before(&now, &unplug_at)) {
++        unplug(ANT);
++        return;
++    }
++    while (outbox && in_queue && !ANT->unplugged && !before(&now, &outbox->due)) {
++        struct message *m = outbox;
++        struct urb *u = in_queue;
++        int n = m->len < u->length ? m->len : u->length;
++
++        outbox = m->next;
++        memcpy(u->data, m->bytes, n);
++        u->actual = n;
++        complete(u, 0);
++        free(m);
++    }
++}
++
++static void *device_thread(void *unused)
++{
++    struct timespec next_broadcast;
++
++    (void)unused;
++    clock_gettime(CLOCK_MONOTONIC, &next_broadcast);
++    pthread_mutex_lock(&lock);
++    for (;;) {
++        struct timespec now, wake, real;
++        long ns;
++
++        deliver();
++        clock_gettime(CLOCK_MONOTONIC, &now);
++        if (traffic_hz > 0 && !before(&now, &next_broadcast)) {
++            static unsigned char page[9];
++
++            page[1]++;
++            send_message(0x4e, page, sizeof(page), 0);  /* broadcast data, channel 0 */
++            add_us(&next_broadcast, 1000000 / traffic_hz);
++        }
++        wake = now;
++        add_us(&wake, 50000);
++        if (outbox && before(&outbox->due, &wake))
++            wake = outbox->due;
++        if (traffic_hz > 0 && before(&next_broadcast, &wake))
++            wake = next_broadcast;
++        if (unplug_armed && before(&unplug_at, &wake))
++            wake = unplug_at;
++
++        /* the condition variable runs on CLOCK_REALTIME */
++        ns = (wake.tv_sec - now.tv_sec) * 1000000000L + (wake.tv_nsec - now.tv_nsec);
++        clock_gettime(CLOCK_REALTIME, &real);
++        add_us(&real, ns > 0 ? ns / 1000 : 0);
++        pthread_cond_timedwait(&changed, &lock, &real);
++    }
++    return NULL;
++}
++
++/* ---- usbfs ---------------------------------------------------------------- */
++
++static struct device *device_at(const char *path)
++{
++    size_t n = strlen(root);
++    int i;
++
++    if (!root[0] || strncmp(path, root, n) || path[n] != '/')
++        return NULL;
++    for (i = 0; i < NDEVICES; i++)
++        if (!strcmp(path + n + 1, devices[i].node))
++            return &devices[i];
++    return NULL;
++}
++
++static int endpoint_type(struct device *d, unsigned char address)
++{
++    int i;
++
++    for (i = 0; i < d->nendpoints; i++)
++        if (d->endpoints[i].address == address)
++            return d->endpoints[i].type;
++    return -1;
++}
++
++/* usbfs claims an unclaimed interface on first use (checkintf()) */
++static int use_interface(struct file *f)
++{
++    struct device *d = f->device;
++
++    if (d->claimed_by == f)
++        return 0;
++    if (d->claimed_by || d->driver[0])
++        return -EBUSY;
++    d->claimed_by = f;
++    return 0;
++}
++
++static void release_interface(struct file *f)
++{
++    if (f->device->claimed_by != f)
++        return;
++    f->device->claimed_by = NULL;
++    /* destroy_async_on_interface() */
++    while (f->pending)
++        complete(f->pending, -ENOENT);
++}
++
++static int string_descriptor(struct device *d, int index, unsigned char *out, int max)
++{
++    unsigned char b[256];
++    int n, i;
++
++    if (index == 0) {
++        b[0] = 4; b[1] = 3; b[2] = 0x09; b[3] = 0x04;  /* English (US) */
++        n = 4;
++    } else if (index < 4 && d->strings[index]) {
++        const char *s = d->strings[index];
++
++        for (i = 0; s[i]; i++) {
++            b[2 + 2 * i] = s[i];
++            b[3 + 2 * i] = 0;
++        }
++        b[0] = n = 2 + 2 * i;
++        b[1] = 3;
++    } else
++        return -EPIPE;
++    if (n > max)
++        n = max;
++    memcpy(out, b, n);
++    return n;
++}
++
++static int control(struct file *f, struct usbdevfs_ctrltransfer *c)
++{
++    struct device *d = f->device;
++    unsigned char *data = c->data;
++    int n;
++
++    if (c->bRequestType == 0x80 && c->bRequest == 6) {         /* GET_DESCRIPTOR */
++        switch (c->wValue >> 8) {
++        case 1:
++            n = c->wLength < 18 ? c->wLength : 18;
++            memcpy(data, d->descriptors, n);
++            return n;
++        case 2:
++            n = d->descriptors_len - 18;
++            if (n > c->wLength)
++                n = c->wLength;
++            memcpy(data, d->descriptors + 18, n);
++            return n;
++        case 3:
++            return string_descriptor(d, c->wValue & 0xff, data, c->wLength);
++        }
++        return -EPIPE;
++    }
++    if (c->bRequestType == 0x80 && c->bRequest == 8 && c->wLength >= 1) {  /* GET_CONFIGURATION */
++        data[0] = d->config;
++        return 1;
++    }
++    return -EPIPE;
++}
++
++/* USBDEVFS_BULK: waits for its own transfer, never on the completion list */
++static int bulk(struct file *f, struct usbdevfs_bulktransfer *b)
++{
++    struct device *d = f->device;
++    struct timespec deadline;
++    struct urb u;
++    int ret;
++
++    if (endpoint_type(d, b->ep) < 0)
++        return -ENOENT;
++    if ((ret = use_interface(f)))
++        return ret;
++    if (!(b->ep & 0x80)) {
++        log_event("bulk out ep %02x %u bytes", b->ep, b->len);
++        if (d->is_ant)
++            ant_receive(d, b->data, b->len);
++        return b->len;
++    }
++
++    memset(&u, 0, sizeof(u));
++    u.file = f;
++    u.endpoint = b->ep;
++    u.length = b->len;
++    u.sync = 1;
++    u.data = malloc(b->len ? b->len : 1);
++    enqueue(&u);
++    deliver();
++    clock_gettime(CLOCK_REALTIME, &deadline);
++    add_us(&deadline, (long)b->timeout * 1000);
++    while (!u.done) {
++        if (!b->timeout)
++            pthread_cond_wait(&changed, &lock);
++        else if (pthread_cond_timedwait(&changed, &lock, &deadline) == ETIMEDOUT && !u.done) {
++            unqueue(&u);
++            free(u.data);
++            return -ETIMEDOUT;
++        }
++    }
++    ret = u.status ? u.status : u.actual;
++    if (ret > 0)
++        memcpy(b->data, u.data, u.actual);
++    free(u.data);
++    return ret;
++}
++
++static int submit(struct file *f, struct usbdevfs_urb *uu)
++{
++    struct device *d = f->device;
++    int type = endpoint_type(d, uu->endpoint), ret;
++    struct urb *u;
++
++    if (type < 0)
++        return -ENOENT;
++    if (uu->type == USBDEVFS_URB_TYPE_INTERRUPT && type != EP_INTERRUPT)
++        return -EINVAL;
++    if (uu->type == USBDEVFS_URB_TYPE_BULK && type != EP_BULK && type != EP_INTERRUPT)
++        return -EINVAL;
++    if (uu->buffer_length < 0)
++        return -EINVAL;
++    if ((ret = use_interface(f)))
++        return ret;
++
++    u = calloc(1, sizeof(*u));
++    u->file = f;
++    u->user = uu;
++    u->endpoint = uu->endpoint;
++    u->user_buffer = uu->buffer;
++    u->length = uu->buffer_length;
++    u->data = malloc(u->length ? u->length : 1);
++    u->next = f->pending;
++    f->pending = u;
++    if (u->endpoint & 0x80) {
++        enqueue(u);
++        deliver();
++    } else {
++        memcpy(u->data, uu->buffer, u->length);
++        if (d->is_ant)
++            ant_receive(d, u->data, u->length);
++        u->actual = u->length;
++        complete(u, 0);
++    }
++    return 0;
++}
++
++static int reap(struct file *f, void **arg, int block)
++{
++    struct urb *u;
++
++    while (!(u = f->completed)) {
++        if (f->device->unplugged)
++            return -ENODEV;
++        if (!block)
++            return -EAGAIN;
++        pthread_cond_wait(&changed, &lock);
++    }
++    f->completed = u->next;
++    if (!f->completed)
++        f->completed_tail = NULL;
++    update_ready(f);
++
++    /* now, and only now, the kernel writes to the program's memory */
++    if ((u->endpoint & 0x80) && u->actual > 0)
++        memcpy(u->user_buffer, u->data, u->actual);
++    u->user->status = u->status;
++    u->user->actual_length = u->actual;
++    *arg = u->user;
++    free(u->data);
++    free(u);
++    return 0;
++}
++
++static int discard(struct file *f, void *user)
++{
++    struct urb *u;
++
++    for (u = f->pending; u; u = u->next)
++        if (u->user == user) {
++            complete(u, -ENOENT);
++            return 0;
++        }
++    return -EINVAL;
++}
++
++static int disconnect_claim(struct file *f, struct usbdevfs_disconnect_claim *dc)
++{
++    struct device *d = f->device;
++    int ret;
++
++    if (dc->interface != 0)
++        return -EINVAL;
++    if (d->claimed_by && d->claimed_by != f)
++        return -EBUSY;          /* another file holds it: its driver is "usbfs" */
++    if (d->driver[0]) {
++        if ((dc->flags & USBDEVFS_DISCONNECT_CLAIM_EXCEPT_DRIVER) && !strcmp(dc->driver, d->driver))
++            return -EBUSY;
++        if ((dc->flags & USBDEVFS_DISCONNECT_CLAIM_IF_DRIVER) && strcmp(dc->driver, d->driver))
++            return -EBUSY;
++        log_event("detach %s from %s", d->driver, d->node);
++        d->driver[0] = 0;
++    }
++    ret = use_interface(f);
++    log_event("claim %s (disconnect-claim): %s", d->node, ret ? "EBUSY" : "ok");
++    return ret;
++}
++
++static int usbfs_ioctl(struct file *f, unsigned long request, void *arg)
++{
++    struct device *d = f->device;
++    int ret;
++
++    if (!f->writable)
++        return -EPERM;
++    if (request == USBDEVFS_REAPURB || request == USBDEVFS_REAPURBNDELAY)
++        return reap(f, arg, request == USBDEVFS_REAPURB);
++    if (d->unplugged)
++        return -ENODEV;
++
++    switch (request) {
++    case USBDEVFS_CONNECTINFO:
++        ((struct usbdevfs_connectinfo *)arg)->devnum = d->devnum;
++        ((struct usbdevfs_connectinfo *)arg)->slow = 0;
++        return 0;
++    case USBDEVFS_CONTROL:
++        return control(f, arg);
++    case USBDEVFS_BULK:
++        return bulk(f, arg);
++    case USBDEVFS_SUBMITURB:
++        return submit(f, arg);
++    case USBDEVFS_DISCARDURB:
++        return discard(f, arg);
++    case USBDEVFS_SETCONFIGURATION:
++        if (d->claimed_by || d->driver[0]) {
++            log_event("setconfig %d on %s: EBUSY", *(int *)arg, d->node);
++            return -EBUSY;
++        }
++        d->config = *(int *)arg;
++        log_event("setconfig %d on %s", d->config, d->node);
++        return 0;
++    case USBDEVFS_CLAIMINTERFACE:
++        if (*(unsigned int *)arg != 0)
++            return -EINVAL;
++        ret = use_interface(f);
++        log_event("claim %s: %s", d->node, ret ? "EBUSY" : "ok");
++        if (!ret && d->is_ant && unplug_ms && !unplug_armed) {
++            unplug_armed = 1;
++            clock_gettime(CLOCK_MONOTONIC, &unplug_at);
++            add_us(&unplug_at, (long)unplug_ms * 1000);
++            pthread_cond_broadcast(&changed);
++        }
++        return ret;
++    case USBDEVFS_RELEASEINTERFACE:
++        if (*(unsigned int *)arg != 0 || d->claimed_by != f)
++            return -EINVAL;
++        release_interface(f);
++        log_event("release %s", d->node);
++        return 0;
++    case USBDEVFS_DISCONNECT_CLAIM:
++        return disconnect_claim(f, arg);
++    case USBDEVFS_IOCTL: {
++        struct usbdevfs_ioctl *io = arg;
++
++        if (io->ioctl_code == USBDEVFS_DISCONNECT) {
++            if (!d->driver[0])
++                return -ENODATA;
++            log_event("detach %s from %s", d->driver, d->node);
++            d->driver[0] = 0;
++            return 0;
++        }
++        if (io->ioctl_code == (int)USBDEVFS_HUB_PORTINFO) {
++            struct usbdevfs_hub_portinfo *info = io->data;
++            int i;
++
++            log_event("portinfo %s", d->node);
++            if (strcmp(d->driver, "hub"))
++                return -ENOSYS;         /* not a hub driver's ioctl */
++            memset(info, 0, sizeof(*info));
++            info->nports = 4;
++            for (i = 0; i < 4; i++)
++                info->port[i] = d->ports[i];
++            return info->nports;
++        }
++        return -ENOTTY;
++    }
++    case USBDEVFS_CLEAR_HALT:
++    case USBDEVFS_RESETEP:
++        return 0;
++    case USBDEVFS_RESET:
++        log_event("reset %s", d->node);
++        return 0;
++    }
++    return -ENOTTY;
++}
++
++/* ---- the interposed C library ---------------------------------------------- */
++
++static int track(const char *path, int flags, int fd)
++{
++    struct device *d;
++    struct file *f;
++
++    if (fd < 0 || fd >= 65536 || !(d = device_at(path)))
++        return fd;
++    f = calloc(1, sizeof(*f));
++    f->fd = fd;
++    f->device = d;
++    f->writable = (flags & O_ACCMODE) != O_RDONLY;
++    f->ready = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
++    pthread_mutex_lock(&lock);
++    f->next = files;
++    files = f;
++    tracked[fd] = 1;
++    if (!device_thread_started) {
++        pthread_t t;
++
++        device_thread_started = 1;
++        pthread_create(&t, NULL, device_thread, NULL);
++    }
++    update_ready(f);
++    pthread_mutex_unlock(&lock);
++    return fd;
++}
++
++static int refused(const char *path, int flags)
++{
++    struct device *d = device_at(path);
++
++    return d && (flags & O_ACCMODE) != O_RDONLY && !d->writable;
++}
++
++int open(const char *path, int flags, ...)
++{
++    mode_t mode = 0;
++
++    if (flags & (O_CREAT | O_TMPFILE)) {
++        va_list args;
++
++        va_start(args, flags);
++        mode = va_arg(args, mode_t);
++        va_end(args);
++    }
++    if (!real_open)
++        init();
++    if (refused(path, flags)) {
++        errno = EACCES;
++        return -1;
++    }
++    return track(path, flags, real_open(path, flags, mode));
++}
++
++int open64(const char *path, int flags, ...) __attribute__((alias("open")));
++int __open_2(const char *path, int flags) { return open(path, flags); }
++int __open64_2(const char *path, int flags) { return open(path, flags); }
++
++int openat(int dirfd, const char *path, int flags, ...)
++{
++    mode_t mode = 0;
++
++    if (flags & (O_CREAT | O_TMPFILE)) {
++        va_list args;
++
++        va_start(args, flags);
++        mode = va_arg(args, mode_t);
++        va_end(args);
++    }
++    if (!real_openat)
++        init();
++    if (path[0] != '/')
++        return real_openat(dirfd, path, flags, mode);
++    if (refused(path, flags)) {
++        errno = EACCES;
++        return -1;
++    }
++    return track(path, flags, real_openat(dirfd, path, flags, mode));
++}
++
++int close(int fd)
++{
++    if (!real_close)
++        init();
++    if (fd >= 0 && fd < 65536 && tracked[fd]) {
++        struct file **p, *f;
++
++        pthread_mutex_lock(&lock);
++        for (p = &files; (f = *p); p = &f->next)
++            if (f->fd == fd) {
++                struct urb *u;
++
++                *p = f->next;
++                /* usbdev_release(): release the interface, free every URB */
++                release_interface(f);
++                while ((u = f->pending)) {
++                    f->pending = u->next;
++                    unqueue(u);
++                    free(u->data);
++                    free(u);
++                }
++                while ((u = f->completed)) {
++                    f->completed = u->next;
++                    free(u->data);
++                    free(u);
++                }
++                real_close(f->ready);
++                free(f);
++                break;
++            }
++        tracked[fd] = 0;
++        pthread_mutex_unlock(&lock);
++    }
++    return real_close(fd);
++}
++
++int ioctl(int fd, unsigned long request, ...)
++{
++    struct file *f;
++    va_list args;
++    void *arg;
++    int ret;
++
++    va_start(args, request);
++    arg = va_arg(args, void *);
++    va_end(args);
++    if (!real_ioctl)
++        init();
++    if (fd < 0 || fd >= 65536 || !tracked[fd])
++        return real_ioctl(fd, request, arg);
++
++    pthread_mutex_lock(&lock);
++    f = file_of(fd);
++    ret = f ? usbfs_ioctl(f, request, arg) : -EBADF;
++    pthread_mutex_unlock(&lock);
++    if (ret < 0) {
++        errno = -ret;
++        return -1;
++    }
++    return ret;
++}
++
++/* Each device file is swapped for its eventfd, then given usbfs's events. */
++int poll(struct pollfd *fds, nfds_t n, int timeout)
++{
++    struct pollfd local[16];
++    nfds_t i;
++    int any = 0, ret;
++
++    if (!real_poll)
++        init();
++    for (i = 0; i < n; i++)
++        if (fds[i].fd >= 0 && fds[i].fd < 65536 && tracked[fds[i].fd])
++            any = 1;
++    if (!any || n > 16)
++        return real_poll(fds, n, timeout);
++
++    pthread_mutex_lock(&lock);
++    for (i = 0; i < n; i++) {
++        struct file *f = file_of(fds[i].fd);
++
++        local[i] = fds[i];
++        if (f) {
++            local[i].fd = f->ready;
++            local[i].events = POLLIN;
++        }
++    }
++    pthread_mutex_unlock(&lock);
++
++    ret = real_poll(local, n, timeout);
++    if (ret < 0)
++        return ret;
++
++    pthread_mutex_lock(&lock);
++    ret = 0;
++    for (i = 0; i < n; i++) {
++        struct file *f = file_of(fds[i].fd);
++
++        if (f) {
++            fds[i].revents = 0;
++            if (f->completed && f->writable && (fds[i].events & POLLOUT))
++                fds[i].revents |= POLLOUT;
++            if (f->device->unplugged)
++                fds[i].revents |= POLLHUP | POLLERR;
++        } else
++            fds[i].revents = local[i].revents;
++        if (fds[i].revents)
++            ret++;
++    }
++    pthread_mutex_unlock(&lock);
++    return ret;
++}
++
++int __poll_chk(struct pollfd *fds, nfds_t n, int timeout, size_t len)
++{
++    (void)len;
++    return poll(fds, n, timeout);
++}
++
++#endif /* USBEMU_MKTREE */

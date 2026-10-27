@@ -1,0 +1,8 @@
+# your Wine prefix, or the link to it
+/prefix
+# made by zwift-ant.sh setup and by zwift.sh
+/ant/src/
+/ant/lib/
+/ant/turned-off
+/logs/
+__pycache__/
