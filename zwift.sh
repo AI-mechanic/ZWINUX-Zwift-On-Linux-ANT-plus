@@ -3,13 +3,15 @@
 #
 # Before every start it updates the game from Zwift's servers
 # (zwift-fetch.py), rebuilds the ANT+ library if Wine was upgraded
-# (zwift-ant.sh ensure) and checks that the ANT+ stick is there. Until the
-# game exits it keeps the screen on, and it tells you when the stick drops
-# out or comes back.
+# (zwift-ant.sh ensure) and checks that the ANT+ stick is there. A small
+# window shows how far it has got until the game is up; closing it stops
+# the start. Until the game exits it keeps the screen on, and it tells you
+# when the stick drops out or comes back.
 #
 #   zwift.sh                  check, update, start
 #   zwift.sh --check          the checks only; starts nothing
 #   SKIP_UPDATE=1 zwift.sh    start without looking for a game update
+#   ZWIFT_WINDOW=0 zwift.sh   start without the window
 #
 # Why the start is unusual: launcher 1.2.0 uses Windows.UI.Composition
 # (WinRT), which Wine only partly provides, so it exits a few seconds after
@@ -48,16 +50,132 @@ ICON=$(sed -n 's/^Icon=//p' "$HOME/.local/share/applications/zwift.desktop" 2>/d
 ICON_ARGS=()
 [ -n "$ICON" ] && ICON_ARGS=(-i "$ICON")
 
+# --- the window -------------------------------------------------------------
+# From the click until the game is up, a small window says which of three
+# steps the start is at, with one bar for the whole start; a download moves
+# it by the byte. Closing the window, or Cancel, stops the start. zenity
+# draws it. Without zenity or a desktop, or with ZWIFT_WINDOW=0, there is
+# no window, and notifications say what matters; ZWIFT_WINDOW=1 asks for
+# one even without a desktop in sight (the tests' fake zenity needs none).
+UI=             # a file descriptor; what is written to it, the window shows
+UI_PID=         # the process looking after the window
+STEP=           # the window's first line: "Step 1 of 3 · Game update"
+BAR_FROM=0      # where the bar stands when this step begins, in percent,
+BAR_TO=0        # and where when it ends
+
+window_open() {
+  case "${ZWIFT_WINDOW:-}" in
+    0) return 0 ;;
+    1) ;;
+    *) [ -n "${WAYLAND_DISPLAY:-}${DISPLAY:-}" ] || return 0 ;;
+  esac
+  command -v zenity >/dev/null 2>&1 || return 0
+  exec {UI}> >(window_process)
+  UI_PID=$!
+}
+
+# zenity reads the window's pipe. The pipe's end alone cannot close the
+# window, because Wine and the other programs started from here inherit a
+# copy of it; so the window also closes when this script's process is gone.
+# Exit status 0: the window was up, and is now closed. 1: it went within a
+# second and a half, too soon for anyone to have closed it, so it never
+# opened (no display zenity could use, say), which is no reason to stop.
+window_process() {
+  local shown watcher since=${EPOCHREALTIME/[.,]/}
+  zenity --progress --title Zwift --width 460 --auto-close --text "Starting Zwift" \
+    <&0 >/dev/null 2>&1 &
+  shown=$!
+  tail --pid=$$ -f /dev/null </dev/null >/dev/null 2>&1 &
+  watcher=$!
+  wait -n "$shown" "$watcher"
+  kill "$shown" "$watcher" 2>/dev/null
+  [ $(( ${EPOCHREALTIME/[.,]/} - since )) -ge 1500000 ]
+}
+
+step() {   # step N HEADING FROM TO: step N of 3 begins, and takes the bar from FROM to TO
+  STEP="Step $1 of 3 · $2" BAR_FROM=$3 BAR_TO=$4
+}
+
+# window PERCENT TEXT: PERCENT of this step is done, and TEXT is what is
+# happening. PERCENT "busy" makes the bar pulse, for a wait of unknown length.
+window() {
+  local bar
+  [ -n "$UI" ] || return 0
+  case $1 in
+    busy) bar=pulsate:true ;;
+    ''|*[!0-9]*) return 0 ;;
+    *) bar="pulsate:false"$'\n'$(( BAR_FROM + (BAR_TO - BAR_FROM) * $1 / 100 )) ;;
+  esac
+  window_write "$bar" "$2"
+}
+
+# window_says TEXT: the same, with the bar left where it is. Fails if there
+# is no window, or it has gone, so that the caller can say it another way.
+window_says() { [ -n "$UI" ] && kill -0 "$UI_PID" 2>/dev/null && window_write "" "$1"; }
+
+window_write() {
+  local text=${2//\\/\\\\}           # zenity reads backslashes as escapes,
+  text=${text//$'\n'/ }              # and every line as a message of its own
+  # A subshell writes, so that a window gone away cannot take this script
+  # with it: writing to a pipe nobody reads ends the writer.
+  (
+    [ -z "$1" ] || printf '%s\n' "$1"
+    printf '# %s\\n%s\n' "$STEP" "$text"
+  ) 1>&"$UI" 2>/dev/null
+  return 0
+}
+
+window_close() {   # the start is over
+  [ -n "$UI" ] || return 0
+  (printf 'pulsate:false\n100\n' >&"$UI") 2>/dev/null       # --auto-close
+  exec {UI}>&-
+  UI='' UI_PID=''
+}
+
+# Was the window closed, or Cancel pressed? Asked wherever the start can
+# stop cleanly.
+cancelled() {
+  local status
+  [ -n "$UI_PID" ] || return 1
+  kill -0 "$UI_PID" 2>/dev/null && return 1
+  wait "$UI_PID"
+  status=$?
+  exec {UI}>&-
+  UI='' UI_PID=''
+  [ "$status" = 0 ] && return 0
+  echo "The window could not open; starting without it."
+  return 1
+}
+
+stop() {   # stop [wine]: after a Cancel; "wine" also stops what Wine runs
+  echo "Cancelled; Zwift is not started."
+  [ "${1:-}" = wine ] && wineserver -k >/dev/null 2>&1
+  exit 0
+}
+
+# --- messages ---------------------------------------------------------------
 # Notifications, because the app grid gives no terminal. --check just prints.
+# While the window is up, news goes there instead; warnings go to a
+# notification too, which stays after the window has gone.
 notify() {
   [ "$CHECK_ONLY" = 1 ] && return 0
   command -v notify-send >/dev/null 2>&1 &&
     notify-send -a Zwift "${ICON_ARGS[@]}" "$@" Zwift "$MSG" 2>/dev/null
   return 0
 }
-note() { MSG=$1; notify; echo "$1"; }
-warn() { MSG=$1; notify -u critical; echo "$1" >&2; }
-fail() { warn "$1"; exit 1; }
+note() { MSG=$1; window_says "$1" || notify; echo "$1"; }
+warn() { MSG=$1; window_says "$1"; notify -u critical; echo "$1" >&2; }
+fail() {
+  MSG=$1
+  echo "$1" >&2
+  if [ -n "$UI_PID" ] && kill -0 "$UI_PID" 2>/dev/null; then
+    window_close
+    zenity --error --title Zwift --no-markup --text "$1" </dev/null >/dev/null 2>&1 &
+  else
+    notify -u critical
+  fi
+  exit 1
+}
 
 # Process matching is fiddly under Wine: ZwiftApp's comm is "main", the
 # launcher's is cut to 15 characters, and RunFromProcess carries both
@@ -81,53 +199,84 @@ stick_present() {
 # Zwift's launcher normally updates the game. Ours exits first, so do it
 # here. A check is two small downloads and a look at the local file sizes,
 # a second or two. Without a network the installed game may still run.
+DOWNLOADED=0
 update_game() {
-  [ "${SKIP_UPDATE:-0}" = 1 ] && return 0
+  [ "${SKIP_UPDATE:-0}" = 1 ] && { window 100 "Not looking for updates (SKIP_UPDATE=1)"; return 0; }
   [ -f "$FETCH" ] || { echo "zwift-fetch.py is missing; no update check"; return 0; }
+  window busy "Looking for an update"
   python3 "$FETCH" --check "$ZDIR" >"$FETCHLOG" 2>&1
   case $? in
-    0) echo "Game: up to date" ;;
+    0) window 100 "The game is up to date"; echo "Game: up to date" ;;
     3)
       if [ "$CHECK_ONLY" = 1 ]; then
         echo "Game: an update is waiting; the next start downloads it"
       else
-        note "Downloading a Zwift update; this can take a while."
-        if python3 "$FETCH" "$ZDIR" >>"$FETCHLOG" 2>&1; then
-          note "Update complete."
-        else
-          warn "The update is incomplete (see $FETCHLOG); starting anyway."
-        fi
+        download_update
       fi
       ;;
-    *) echo "Game: the update check failed (see $FETCHLOG)" ;;
+    *) window 100 "The update check failed"; echo "Game: the update check failed (see $FETCHLOG)" ;;
   esac
+}
+
+# The download itself. zwift-fetch.py's --progress lines move the bar; the
+# rest of its output goes to the log.
+download_update() {
+  local from fetch line
+  cancelled && stop
+  DOWNLOADED=1
+  step 1 "Game update" 0 90             # the download is most of the start
+  note "Downloading a Zwift update; this can take a while."
+  exec {from}< <(exec python3 "$FETCH" --progress "$ZDIR" 2>&1)
+  fetch=$!
+  while IFS= read -r line <&"$from"; do
+    case $line in
+      "@progress "*)
+        line=${line#@progress }
+        window "${line%% *}" "Downloading the update: ${line#* }"
+        ;;
+      *) printf '%s\n' "$line" >>"$FETCHLOG" ;;
+    esac
+    if cancelled; then
+      kill "$fetch" 2>/dev/null       # finished files stay; the next start fetches the rest
+      stop
+    fi
+  done
+  exec {from}<&-
+  if wait "$fetch"; then
+    note "Update complete."
+  else
+    warn "The update is incomplete (see $FETCHLOG); starting anyway."
+  fi
 }
 
 # --- ANT+ -------------------------------------------------------------------
 ANT_ON=0
 ANT_READY=0
 check_ant() {
-  local out st rc=0
+  local out st n rc=0
+  window busy "Checking ANT+ (after a Wine upgrade, a minute or two)"
   out=$(bash "$ANTCTL" ensure 2>&1) || rc=$?
   case $rc in
-    0) ANT_ON=1; [ -n "$out" ] && note "ANT+: $out" ;;   # it repaired something
-    3) ANT_ON=1; warn "ANT+: $out" ;;
-    2) echo "ANT+: $out"; return 0 ;;                     # turned off on purpose
-    *) warn "ANT+ is unavailable: ${out:-zwift-ant.sh ensure failed}"; return 0 ;;
+    0) ANT_ON=1; window 60 "ANT+ is ready"; [ -n "$out" ] && note "ANT+: $out" ;;  # it repaired something
+    3) ANT_ON=1; window 60 ""; warn "ANT+: $out" ;;
+    2) echo "ANT+: $out"; window 100 "ANT+ is turned off"; return 0 ;;
+    *) window 100 ""; warn "ANT+ is unavailable: ${out:-zwift-ant.sh ensure failed}"; return 0 ;;
   esac
 
   st=$(bash "$ANTCTL" stick)
   if [ "$st" = missing ] && [ "$CHECK_ONLY" = 0 ]; then
     warn "The ANT+ stick is not plugged in. Plug it in; waiting 15 seconds."
-    for _ in $(seq 1 30); do
+    for n in $(seq 30 -1 1); do
+      window 60 "Plug in the ANT+ stick; starting without it in $(( (n + 1) / 2 )) s"
       sleep 0.5
+      cancelled && stop
       st=$(bash "$ANTCTL" stick)
       [ "$st" != missing ] && break
     done
     [ "$st" = missing ] && note "Starting without the ANT+ stick."
   fi
   case "$st" in
-    ready*)  ANT_READY=1; echo "ANT+: stick ready (${st#ready })" ;;
+    ready*)  ANT_READY=1; window 100 "The ANT+ stick is ready"; echo "ANT+: stick ready (${st#ready })" ;;
     locked*) warn "The ANT+ stick is plugged in, but your login cannot use it. Run: $ANTCTL setup" ;;
     *)       echo "ANT+: no stick plugged in" ;;
   esac
@@ -201,11 +350,21 @@ if game_up; then
 fi
 
 keep_awake
-update_game
-[ -f "$ZDIR/ZwiftApp.exe" ] || fail "ZwiftApp.exe is missing; run: python3 $FETCH"
-check_ant
+window_open
 
+step 1 "Game update" 0 20
+update_game
+cancelled && stop
+[ -f "$ZDIR/ZwiftApp.exe" ] || fail "ZwiftApp.exe is missing; run: python3 $FETCH"
+
+# after a download the bar is nearly full; otherwise starting is most of it
+if [ "$DOWNLOADED" = 1 ]; then step 2 ANT+ 90 95; else step 2 ANT+ 20 40; fi
+check_ant
+cancelled && stop
+
+step 3 "Starting Zwift" "$BAR_TO" 100
 cd "$ZDIR" || fail "cannot enter $ZDIR"
+window 0 "Starting the launcher"
 echo "Starting the launcher (it exits after a few seconds; that is expected)."
 wine ZwiftLauncher.exe >"$LOG" 2>&1 &
 
@@ -218,12 +377,15 @@ for _ in $(seq 1 80); do
 done
 [ "$appeared" -eq 1 ] || fail "The launcher never appeared. See $LOG"
 
+window 40 "Starting the game"
 echo "Launcher up; starting the game with RunFromProcess."
 wine RunFromProcess-x64.exe ZwiftLauncher.exe ZwiftApp.exe 2>/dev/null || true
 
 echo "Waiting for the game..."
+window busy "Waiting for the game"
 for _ in $(seq 1 90); do
   game_up && break
+  cancelled && stop wine
   sleep 1
 done
 
@@ -238,6 +400,7 @@ if ! game_up; then
   fail "Zwift did not start."
 fi
 
+window_close
 if [ "$ANT_READY" = 1 ]; then
   note "Zwift is up, and so is the ANT+ stick. Log in inside the game."
 else

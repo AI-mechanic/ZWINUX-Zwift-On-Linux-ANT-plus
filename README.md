@@ -12,6 +12,11 @@ ANT+ USB sticks work in it.
   a Windows driver that Wine does not have. `zwift-ant.sh` builds a Wine
   version of it that talks to the stick through Linux's own USB support,
   and keeps it working when Wine is upgraded.
+- **A progress window.** From the click on the icon until the game is
+  up, a small window shows which of three steps the start is at (game
+  update, ANT+, starting Zwift), with a bar; during an update it shows
+  how much has arrived, how fast, and how long is left. Closing it, or
+  Cancel, stops the start.
 - **Checks.** Before every start you hear about a missing stick (and get
   15 seconds to plug it in), and during the ride about a stick that drops
   out or comes back.
@@ -22,6 +27,10 @@ ANT+ USB sticks work in it.
 
 Tested on Ubuntu 26.04 with WineHQ's wine-staging 11.20 and an ANT USB-m
 stick.
+
+This project is not affiliated with or endorsed by Zwift, Inc. "Zwift" is
+a trademark of Zwift, Inc., named here only to say what these tools are
+for.
 
 ## What you need
 
@@ -36,6 +45,9 @@ stick.
       sudo apt install build-essential git wine-staging-dev
 
   (`wine-stable-dev` or `wine-devel-dev` if that is your Wine.)
+- For the progress window, `zenity`, which most GNOME desktops have
+  already; if it is missing, the installer installs it. Without it,
+  starts work the same, with notifications only.
 
 ## Installing
 
@@ -49,19 +61,24 @@ Wine other than `/opt/wine-staging`, put `WINE_ROOT=` in front, as in
 `WINE_ROOT=/opt/wine-stable ./install.sh ~/Games/zwift/prefix`, here and
 for the other commands below.
 
-The installer points the Zwift icon at `zwift.sh` and sets up ANT+,
-which asks for your password once, to install a udev rule. It ends with
-a test against the stick, so plug the stick in first.
+The installer points the Zwift icon at `zwift.sh`, sets up ANT+, and
+installs `zenity` for the progress window if it is missing; it asks for
+your password for the udev rule that ANT+ needs, and for zenity. The ANT+
+part ends with a test against the stick, so plug the stick in first.
 
 ## Riding
 
 Start Zwift from the app grid as usual. Everything else happens on its
 own: the update, the checks, the rebuild after a Wine upgrade, and
-keeping the screen on while you ride.
+keeping the screen on while you ride. The progress window says where the
+start is at, and closes once the game is up; Zwift's own window follows
+a few seconds later. Warnings come as notifications as well, so they are
+still there after the window has gone.
 
 From a terminal:
 
     ./zwift.sh --check          # is everything ready? starts nothing
+    ZWIFT_WINDOW=0 ./zwift.sh   # a start without the progress window
     ./zwift-ant.sh status       # ANT+ in detail
     ./zwift-ant.sh test         # a full test against the stick (Zwift closed)
     ./zwift-ant.sh setup        # set ANT+ up again
@@ -82,6 +99,7 @@ Zwift working, just without ANT+.
 | A sensor missing after the stick came back | open the pairing screen in Zwift |
 | The screen still blanks during a ride | `zwift.sh` asks GNOME to keep it on; on another desktop, switch screen blanking off while you ride |
 | "Zwift did not start" | look at `logs/launcher.log` and the game log it points to |
+| No progress window | `zenity` is missing: `sudo apt install zenity` |
 | The update failed | `logs/update.log` says why; `./zwift-fetch.py` retries |
 
 ## What is where

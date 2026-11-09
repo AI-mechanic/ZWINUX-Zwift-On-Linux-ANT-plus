@@ -13,23 +13,28 @@ What `zwift.sh` does when the icon is clicked:
    hold it.
 2. Asks GNOME to keep the session from going idle until the script ends
    (see below).
-3. `zwift-fetch.py --check`: is the game up to date? If not, it downloads
-   the update first (`logs/update.log`).
-4. `zwift-ant.sh ensure`: rebuilds the ANT+ library if Wine or the patch
+3. Opens the progress window (see below).
+4. `zwift-fetch.py --check`: is the game up to date? If not, it downloads
+   the update first, with `--progress` (`logs/update.log`).
+5. `zwift-ant.sh ensure`: rebuilds the ANT+ library if Wine or the patch
    changed, and repairs the prefix if something undid its settings. Its
    exit status says what to tell the rider (see below).
-5. Looks for the stick in sysfs, and if it is missing, says so and waits up
+6. Looks for the stick in sysfs, and if it is missing, says so and waits up
    to 15 seconds for it.
-6. Starts `ZwiftLauncher.exe`, and the moment its process exists,
+7. Starts `ZwiftLauncher.exe`, and the moment its process exists,
    `RunFromProcess-x64.exe ZwiftLauncher.exe ZwiftApp.exe`, which starts
-   the game as a child of the launcher's process.
-7. Watches the game's process and the stick until the game exits, then
+   the game as a child of the launcher's process. Once the game's process
+   exists, the window closes.
+8. Watches the game's process and the stick until the game exits, then
    waits three seconds (the game writes the ride's `.fit` file as it
    exits) and stops the prefix's wineserver.
 
 Messages go to the terminal and, because the icon gives no terminal, to
-`notify-send` as well. `zwift.sh --check` runs steps 3 to 5 without
-downloading or starting anything.
+the window while it is up (`note`), or to `notify-send` once it is gone or
+if there is none. Warnings (`warn`) go to `notify-send` in any case, since
+the window may be gone before anyone reads them, and an error that ends
+the start (`fail`) replaces the window with a dialog. `zwift.sh --check`
+runs steps 4 to 6 without a window, a download or a start.
 
 ### Why the screen stays on
 
@@ -51,6 +56,42 @@ given a terminal, `gnome-session-inhibit` hands the terminal to its
 command, and Ctrl+C would then stop `tail` instead of `zwift.sh`. While
 Zwift runs, `gnome-session-inhibit --list` shows the inhibitor as
 `zwift: Riding in Zwift (idle)`.
+
+### The progress window
+
+`zenity --progress` draws it, reading lines from a pipe: a number moves
+the bar, `pulsate:true` and `pulsate:false` switch to a pulsing bar and
+back, and a line that starts with `#` replaces the text, which here is
+always two lines: the step (`Step 2 of 3 · ANT+`) and what is happening.
+`window()`, `window_says()` and `window_close()` write those lines; zenity
+reads backslashes as escapes and each line as a message, so the text's
+backslashes are doubled and its newlines made spaces. Each step has a
+share of one bar for the whole start, set by `step()`: the update check
+0–20 %, ANT+ 20–40 %, starting Zwift the rest, or, when there is a
+download, 0–90 % for the update and the remainder for the other two.
+`--auto-close` makes zenity go at 100 %.
+
+Three things are less obvious:
+
+- **Closing the window.** The pipe's write end is inherited by everything
+  started after it, Wine included, so the pipe does not close when the
+  script ends, and zenity would stay. `window_process()` therefore runs
+  zenity next to `tail --pid=$$`, and whichever ends first, it ends the
+  other. A killed script takes the window with it within a second.
+- **Cancel.** Closing the window or pressing Cancel ends zenity, which
+  `cancelled()` notices at the points where the start can stop cleanly:
+  between the steps, during the download (which it ends; finished files
+  stay), during the wait for the stick, and while waiting for the game
+  (which it ends with `wineserver -k`). Once the game is up, the window
+  is gone and nothing can be cancelled.
+- **A window that never opens.** zenity also ends when it cannot open a
+  window at all, with the same exit status as Cancel. A window that went
+  within 1.5 seconds cannot have been closed by a person, so
+  `window_process()` exits 1 then, and the start goes on without it.
+
+The window opens when there is a desktop (`WAYLAND_DISPLAY` or `DISPLAY`)
+and zenity is installed; `ZWIFT_WINDOW=0` turns it off and `ZWIFT_WINDOW=1`
+on, for the tests. `wait -n` with process IDs needs bash 5.1.
 
 ### Why RunFromProcess
 
@@ -75,6 +116,12 @@ take minutes; `--verify` checksums everything. Each download goes to a
 `.part` file and replaces the old file only once its size and checksum
 are right. Paths in the manifest that would leave the Zwift folder are
 refused.
+
+With `--progress`, a download also prints `@progress PERCENT TEXT` twice
+a second, for the window; the other lines go to `logs/update.log`.
+PERCENT counts bytes, including those of files still arriving, and a
+failed attempt takes its bytes off again. TEXT is ready to show: size,
+speed, and once three seconds have passed, the time left.
 
 ## ANT+
 
@@ -136,7 +183,7 @@ from that driver when Zwift claims it.
 
 | Status | Meaning | `zwift.sh` |
 |---|---|---|
-| 0 | ready; any output says what was repaired | a quiet notification if there was output |
+| 0 | ready; any output says what was repaired | says so in the window (or a notification), if there was output |
 | 1 | not usable (no Wine, build failed with no earlier build, prefix broken) | a warning; starts without ANT+ |
 | 2 | turned off with `remove` | starts without ANT+, silently |
 | 3 | usable, but needs attention (a rebuild failed, an older copy shadows it) | a warning; ANT+ stays on |
@@ -162,12 +209,16 @@ All of it is in this folder, apart from the icon and the udev rule:
 `tests/rehearse.sh` runs the whole thing in a throwaway home with its own
 Wine prefix: `install.sh`, a first start that downloads the game, a ride
 with the stick pulled out and put back, a second click, `zwift.sh` killed
-mid-ride, a Wine upgrade, a damaged prefix while a wineserver is still
-running, `remove`, `setup`, and the stick test with no stick. Stand-ins
+mid-ride, Cancel in the window, `zwift.sh` killed while the window is up,
+a window that cannot open, an error with the window up, a Wine upgrade, a
+damaged prefix while a wineserver is still running, `remove`, `setup`,
+and the stick test with no stick. Stand-ins
 built from `tests/stubs.c` play Zwift's three programs; libusb-wine's usbfs
 emulator plays the stick; a local web server plays Zwift's update server;
-fake `sudo`, `udevadm`, `notify-send` and `gnome-session-inhibit` record
-what they are asked. It
+fake `sudo`, `udevadm`, `notify-send`, `gnome-session-inhibit` and
+`zenity` record what they are asked. The fake zenity also presses Cancel
+(`ZENITY_CANCEL=PATTERN`) or fails to open (`ZENITY_BROKEN=1`), for the
+steps that test those. It
 needs Wine with its development files, mingw-w64, gcc, git and python3,
 and takes a few minutes:
 
@@ -176,7 +227,8 @@ and takes a few minutes:
 Hooks it uses, which nothing else should need: `ZWIFT_SYSFS` and
 `ZWIFT_DEVUSB` (where the stick is looked for), `ZWIFT_UDEV_RULE` (where
 the rule goes), `ZWIFT_CDN` (where updates come from), and
-`ZWIFT_STUB_MS` and `ZWIFT_STUB_OUT` for the stand-in game.
+`ZWIFT_STUB_MS` and `ZWIFT_STUB_OUT` for the stand-in game, and
+`ZWIFT_WINDOW=1` (a window without a desktop).
 
 `ant/ant-test.exe` is the test against a real stick that `setup` and
 `zwift-ant.sh test` run. It replays `ANT_DLL`'s own sequence, so
@@ -193,7 +245,8 @@ version of mingw-w64 (13).
   launcher's process, step 6 is what needs looking at.
 - **Another desktop:** `keep_awake()` is the only part that is GNOME's
   alone. Elsewhere it says it could not ask, and the screen blanks as
-  usual, until it learns that desktop's way of holding off idle.
+  usual, until it learns that desktop's way of holding off idle. The
+  window works wherever zenity does.
 - **A new stick:** add its product ID to the udev rule in `zwift-ant.sh`
   and to `stick_state()` and `stick_present()`. If Linux binds it to a
   kernel driver, the library needs it on its `take_from_kernel[]` list too.

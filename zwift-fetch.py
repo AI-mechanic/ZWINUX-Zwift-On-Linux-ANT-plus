@@ -16,11 +16,19 @@ DIR is the Zwift folder, by default the one in the Wine prefix next to this
 script. Exit status: 0 all is well; 1 the manifest could not be read, or
 DIR does not exist; 2 some downloads failed; 3 (--check) there are files
 to fetch; 4 (--verify) some files are corrupt.
+
+With --progress, a download also prints, twice a second, a line for a
+front end such as zwift.sh's progress window:
+
+    @progress PERCENT TEXT      e.g. "@progress 35 1.2 GiB of 3.4 GiB · 4.5 MiB/s · ..."
+
+PERCENT counts bytes, including those of files still on their way.
 """
 
 import argparse
 import os
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -28,7 +36,7 @@ import urllib.request
 import xml.etree.ElementTree as ET
 import zlib
 from collections import namedtuple
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 
 # ZWIFT_CDN points it elsewhere, for tests
 BASE = os.environ.get("ZWIFT_CDN", "https://cdn.zwift.com/gameassets/Zwift_Updates_Root")
@@ -126,8 +134,21 @@ def read_manifest(directory):
     return version.get("sversion"), folder, entries
 
 
-def download(folder, directory, entry):
-    """Fetch one file into place. Returns (bytes written, error or None)."""
+class Tally:
+    """Bytes received so far, added up across the download threads."""
+
+    def __init__(self):
+        self.bytes = 0
+        self._lock = threading.Lock()
+
+    def add(self, n):
+        with self._lock:
+            self.bytes += n
+
+
+def download(folder, directory, entry, tally):
+    """Fetch one file into place, counting what arrives in tally. Returns
+    (bytes written, error or None)."""
     target = local_path(directory, entry.path)
     temporary = target + ".part"
     os.makedirs(os.path.dirname(target), exist_ok=True)
@@ -135,8 +156,8 @@ def download(folder, directory, entry):
     for attempt in range(ATTEMPTS):
         if attempt:
             time.sleep(attempt)
+        crc = written = 0
         try:
-            crc = written = 0
             request = urllib.request.Request(url_for(folder, entry.path), headers=HEADERS)
             with urllib.request.urlopen(request, timeout=120) as response, \
                     open(temporary, "wb") as out:
@@ -144,16 +165,18 @@ def download(folder, directory, entry):
                     out.write(chunk)
                     crc = zlib.crc32(chunk, crc)
                     written += len(chunk)
+                    tally.add(len(chunk))
         except (urllib.error.URLError, OSError) as e:
             error = "{}: {}".format(type(e).__name__, e)
-            continue
-        if entry.length and written != entry.length:
-            error = "got {} bytes, expected {}".format(written, entry.length)
-        elif entry.checksum is not None and signed(crc) != entry.checksum:
-            error = "checksum {}, expected {}".format(signed(crc), entry.checksum)
         else:
-            os.replace(temporary, target)
-            return written, None
+            if entry.length and written != entry.length:
+                error = "got {} bytes, expected {}".format(written, entry.length)
+            elif entry.checksum is not None and signed(crc) != entry.checksum:
+                error = "checksum {}, expected {}".format(signed(crc), entry.checksum)
+            else:
+                os.replace(temporary, target)
+                return written, None
+        tally.add(-written)                     # this attempt counts for nothing
     try:
         os.remove(temporary)
     except OSError:
@@ -161,23 +184,49 @@ def download(folder, directory, entry):
     return 0, error
 
 
-def download_all(folder, directory, entries):
+def progress_line(got, total, done, count, elapsed):
+    """The --progress line: how far, how fast, how long still."""
+    percent = got * 100 // total if total else done * 100 // max(count, 1)
+    text = "{} of {}".format(human(got), human(total)) if total else "{} of {} files".format(done, count)
+    rate = got / max(elapsed, 0.001)
+    if done < count:
+        percent = min(percent, 99)
+        text += " · {}/s".format(human(rate))
+        if total and elapsed >= 3 and rate > 0:
+            left = (total - got) / rate
+            text += " · " + ("less than a minute left" if left < 60
+                             else "about {} min left".format(round(left / 60)))
+    return "@progress {} {}".format(percent, text)
+
+
+def download_all(folder, directory, entries, progress=False):
     """Fetch the entries in parallel, with progress. Returns the failures."""
-    done = got = 0
+    tally = Tally()
+    total = sum(e.length for e in entries)
+    done = 0
     failures = []
-    started = time.time()
+    started = shown = time.time()
+    if progress:
+        print(progress_line(0, total, 0, len(entries), 0), flush=True)
     with ThreadPoolExecutor(max_workers=WORKERS) as pool:
-        futures = {pool.submit(download, folder, directory, e): e for e in entries}
-        for future in as_completed(futures):
-            written, error = future.result()
-            done += 1
-            got += written
-            if error:
-                failures.append((futures[future].path, error))
-            if done % 50 == 0 or done == len(entries):
-                rate = got / max(time.time() - started, 0.001)
-                print("  {}/{}  {}  {}/s  {} failed".format(
-                    done, len(entries), human(got), human(rate), len(failures)), flush=True)
+        pending = {pool.submit(download, folder, directory, e, tally): e for e in entries}
+        while pending:
+            finished, _ = wait(pending, timeout=0.5, return_when=FIRST_COMPLETED)
+            for future in finished:
+                entry = pending.pop(future)
+                _, error = future.result()
+                done += 1
+                if error:
+                    failures.append((entry.path, error))
+                if done % 50 == 0 or done == len(entries):
+                    rate = tally.bytes / max(time.time() - started, 0.001)
+                    print("  {}/{}  {}  {}/s  {} failed".format(
+                        done, len(entries), human(tally.bytes), human(rate), len(failures)),
+                        flush=True)
+            if progress and (time.time() - shown >= 0.5 or not pending):
+                shown = time.time()
+                print(progress_line(tally.bytes, total, done, len(entries), shown - started),
+                      flush=True)
     return failures
 
 
@@ -236,6 +285,8 @@ def main():
                       help="checksum every file (exit 4 if any is corrupt)")
     mode.add_argument("--repair", action="store_true",
                       help="checksum every file and fetch the corrupt ones again")
+    parser.add_argument("--progress", action="store_true",
+                        help="while downloading, print '@progress PERCENT TEXT' lines for a front end")
     parser.add_argument("directory", nargs="?", default=DEFAULT_DIR,
                         help="the Zwift folder (default: the one in ./prefix)")
     args = parser.parse_args()
@@ -275,7 +326,7 @@ def main():
         if not todo:
             return 0
 
-    failures = download_all(folder, args.directory, todo)
+    failures = download_all(folder, args.directory, todo, args.progress)
     if failures:
         report(failures, "file failed", "files failed")
         print("Run it again to retry them; finished files are kept.")

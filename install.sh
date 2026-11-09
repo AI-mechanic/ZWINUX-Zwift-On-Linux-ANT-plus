@@ -61,5 +61,18 @@ if ! bash "$HERE/zwift-ant.sh" setup; then
   echo "fixed, run: $HERE/zwift-ant.sh setup"
 fi
 
+say "The progress window"
+# zenity draws it; without zenity, starts work the same, with notifications only
+if ! command -v zenity >/dev/null; then
+  echo "installing zenity, which draws the window"
+  if ! { command -v apt-get >/dev/null && sudo apt-get install -y zenity; }; then
+    echo "zenity could not be installed, so starts show no progress window,"
+    echo "only notifications. Once zenity is installed, they show it."
+  fi
+fi
+if command -v zenity >/dev/null; then
+  echo "a start shows its progress in a small window"
+fi
+
 say "Done"
 echo "Start Zwift from the app grid. README.md says what is where."

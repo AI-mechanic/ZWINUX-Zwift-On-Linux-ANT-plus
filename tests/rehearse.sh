@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # Rehearse the whole kit without Zwift and without an ANT+ stick: install,
 # a first start that downloads the game, a ride with the stick pulled out
-# and put back, a double click, zwift.sh killed mid-ride, a Wine upgrade, a
-# damaged prefix, remove, setup again, and the stick test with no stick. It
-# all happens in a throwaway home with its own Wine prefix; nothing outside
-# it is touched.
+# and put back, a double click, zwift.sh killed mid-ride, Cancel in the
+# window, a window that cannot open, an error, zwift.sh killed while the
+# window is up, a Wine upgrade, a damaged prefix, remove, setup again, and
+# the stick test with no stick. It all happens in a throwaway home with its
+# own Wine prefix; nothing outside it is touched.
 #
 #   tests/rehearse.sh
 #   WINE_ROOT=/opt/wine-stable tests/rehearse.sh
@@ -12,7 +13,8 @@
 # Stand-ins built from tests/stubs.c play Zwift's programs, libusb-wine's
 # usbfs emulator (tests/usbemu.c in the patched source) plays the stick, a
 # local web server plays Zwift's update server, and fake sudo, udevadm,
-# notify-send and gnome-session-inhibit record what they are asked to do.
+# notify-send, gnome-session-inhibit and zenity record what they are asked
+# to do.
 # Needs Wine with its development files, mingw-w64, gcc, git and python3.
 
 set -uo pipefail
@@ -40,6 +42,7 @@ check() {   # check DESCRIPTION COMMAND...
 }
 seen() { grep -q -- "$2" "$1"; }      # seen FILE PATTERN
 unseen() { ! grep -q -- "$2" "$1"; }
+gone() { ! pgrep -f -- "$1" >/dev/null; }   # gone PATTERN: no such process
 count() { local n; n=$(grep -c -- "$2" "$1" 2>/dev/null); echo "${n:-0}"; }
 # the inhibitor lets go up to a second after zwift.sh ends: wait for the Nth
 settle() {
@@ -87,6 +90,29 @@ printf '%s\n' 5 >"$T/sys/bus/usb/devices/1-1/devnum"
   # like the real one, it holds the inhibition for as long as its command runs
   printf '#!/bin/sh\necho "held $*" >>"%s/awake.log"\nwhile [ "${1#--}" != "$1" ]; do shift 2; done\n"$@"\necho released >>"%s/awake.log"\n' \
     "$T" "$T" >"$T/bin/gnome-session-inhibit"
+  # The window: it writes down what it is told and goes at 100, as
+  # --auto-close does. ZENITY_CANCEL=PATTERN presses Cancel a person's two
+  # seconds after a line that matches; ZENITY_BROKEN=1 cannot open at all.
+  cat >"$T/bin/zenity" <<EOF
+#!/bin/sh
+log="$T/window.log"
+case \$1 in
+  --error) for a; do last=\$a; done; echo "error: \$last" >>"\$log"; exit 0 ;;
+  --progress) ;;
+  *) exit 1 ;;
+esac
+[ -n "\${ZENITY_BROKEN:-}" ] && { echo "cannot open" >>"\$log"; exit 1; }
+echo opened >>"\$log"
+while IFS= read -r line; do
+  printf '%s\n' "\$line" >>"\$log"
+  [ "\$line" = 100 ] && { echo closed >>"\$log"; exit 0; }
+  if [ -n "\${ZENITY_CANCEL:-}" ] && printf '%s\n' "\$line" | grep -q -- "\$ZENITY_CANCEL"; then
+    sleep 2
+    echo cancelled >>"\$log"
+    exit 1
+  fi
+done
+EOF
 }
 chmod +x "$T/bin/"*
 
@@ -128,6 +154,7 @@ export ZWIFT_SYSFS="$T/sys" ZWIFT_DEVUSB="$T/usb" ZWIFT_UDEV_RULE="$T/etc/70-ant
 export ZWIFT_CDN="http://127.0.0.1:$port" NO_PROXY="127.0.0.1" no_proxy="127.0.0.1"
 export USBEMU_ROOT="$T/usb" USB_DEVFS_PATH="$T/usb" USBEMU_DRIVER=usb_serial_simple
 export ZWIFT_STUB_OUT="$T/app.txt" ZWIFT_STUB_MS=9000 WINEDEBUG=-all
+export ZWIFT_WINDOW=1           # the window, without a desktop: zenity is fake
 
 echo "creating a Wine prefix"
 WINEPREFIX="$KIT/prefix" "$WINE_ROOT/bin/wineboot" -i >/dev/null 2>&1
@@ -169,6 +196,12 @@ settle 1
 check "the laptop was kept awake from the click on" \
   seen "$T/awake.log" "^held --app-id zwift --reason Riding in Zwift --inhibit idle tail --pid="
 check "and allowed to sleep again after the ride" test "$(count "$T/awake.log" '^released')" = 1
+check "the window showed the update" seen "$T/window.log" "^# Step 1 of 3 · Game update.*Downloading the update: "
+check "the ANT+ check" seen "$T/window.log" "^# Step 2 of 3 · ANT+"
+check "and the start" seen "$T/window.log" "^# Step 3 of 3 · Starting Zwift"
+check "the download took the bar to 90%" seen "$T/window.log" "^90$"
+check "the window closed when the game was up" seen "$T/window.log" "^closed$"
+check "what it showed was not notified as well" unseen "$T/notifications.log" "Downloading"
 
 step "A second click while Zwift starts"
 ZWIFT_STUB_MS=5000 "$KIT/zwift.sh" >"$T/first.log" 2>&1 &
@@ -194,6 +227,48 @@ wait "$start"
 settle 3
 check "the laptop may sleep again" test "$(count "$T/awake.log" '^released')" = 3
 WINEPREFIX="$KIT/prefix" "$WINE_ROOT/bin/wineserver" -k 2>/dev/null       # the game it left
+WINEPREFIX="$KIT/prefix" "$WINE_ROOT/bin/wineserver" -w
+
+step "Cancel in the window, while it waits for the stick"
+mv "$T/sys/bus/usb/devices/1-1" "$T/sys/unplugged"
+ZENITY_CANCEL="Plug in the ANT+ stick" "$KIT/zwift.sh" >"$T/cancel.log" 2>&1
+check "the start stops" seen "$T/cancel.log" "Cancelled; Zwift is not started"
+check "before the launcher" unseen "$T/cancel.log" "Starting the launcher"
+settle 4
+check "and the laptop may sleep again" test "$(count "$T/awake.log" '^released')" = 4
+
+step "zwift.sh killed while the window is up"
+before=$(count "$T/window.log" "Plug in the ANT+ stick")
+"$KIT/zwift.sh" >"$T/killed-window.log" 2>&1 &
+start=$!
+for _ in $(seq 1 40); do
+  [ "$(count "$T/window.log" "Plug in the ANT+ stick")" -gt $((before + 1)) ] && break
+  sleep 0.5
+done
+script=$(sed -n 's/^held .*--pid=\([0-9]*\) .*/\1/p' "$T/awake.log" | tail -n 1)
+kill -9 "$script"
+wait "$start"
+mv "$T/sys/unplugged" "$T/sys/bus/usb/devices/1-1"
+window="^/bin/sh $T/bin/zenity --progress"
+for _ in $(seq 1 10); do gone "$window" && break; sleep 0.5; done
+check "the window goes with it" gone "$window"
+settle 5
+
+step "A window that cannot open"
+ZENITY_BROKEN=1 ZWIFT_STUB_MS=2000 "$KIT/zwift.sh" >"$T/broken.log" 2>&1
+check "is no reason to stop" seen "$T/broken.log" "could not open; starting without it"
+check "Zwift starts all the same" seen "$T/broken.log" "Zwift is up"
+settle 6
+
+step "An error, with the window up"
+mv "$ZDIR/ZwiftApp.exe" "$T/ZwiftApp.exe.away"
+SKIP_UPDATE=1 "$KIT/zwift.sh" >"$T/error.log" 2>&1
+mv "$T/ZwiftApp.exe.away" "$ZDIR/ZwiftApp.exe"
+for _ in $(seq 1 10); do seen "$T/window.log" "^error: " && break; sleep 0.3; done   # it opens on its own
+check "is shown in a dialog" seen "$T/window.log" "^error: ZwiftApp.exe is missing"
+check "instead of a notification" unseen "$T/notifications.log" "ZwiftApp.exe is missing"
+settle 7
+WINEPREFIX="$KIT/prefix" "$WINE_ROOT/bin/wineserver" -k 2>/dev/null
 WINEPREFIX="$KIT/prefix" "$WINE_ROOT/bin/wineserver" -w
 
 step "A Wine upgrade"
@@ -239,7 +314,8 @@ USB_DEVFS_PATH="$T/no-usb" "$KIT/zwift-ant.sh" test >"$T/nostick.log" 2>&1
 check "says that it tested only the library" seen "$T/nostick.log" "RESULT: PASSED, but without a stick"
 
 step "The checks along the way"
-check "no zwift.sh --check kept the laptop awake" test "$(count "$T/awake.log" '^held')" = 3
+check "no zwift.sh --check kept the laptop awake" test "$(count "$T/awake.log" '^held')" = 7
+check "or opened a window" test "$(count "$T/window.log" '^opened')" = 6
 
 echo
 if [ "$failed" = 0 ]; then
